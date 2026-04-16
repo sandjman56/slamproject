@@ -107,20 +107,24 @@ if PLATFORM == 'colab':
     CHECKPOINT_ROOT = '/content/drive/MyDrive/slam_results'
 
 elif PLATFORM == 'kaggle':
-    # Build/dataset live in /kaggle/temp (~70 GB, wiped between sessions).
-    # Results live in /kaggle/working/slam_results (persists across commits of
-    # the same notebook, ~20 GB cap — we only write trajectories + JSON here).
-    SCRATCH = '/kaggle/temp/workspace'
-    os.makedirs(SCRATCH, exist_ok=True)
-    if not os.path.exists('/content'):
-        os.symlink(SCRATCH, '/content')
+    # Kaggle rootfs is an overlayfs that refuses os.symlink at '/', so we
+    # mkdir /content directly. Kaggle's session has ~73 GB of shared scratch
+    # across '/', /kaggle/temp, and /kaggle/working — plenty for the build
+    # tree + EuRoC. Checkpoints go to /kaggle/working/slam_results which
+    # persists across notebook commits (the only "saved" storage on Kaggle).
+    os.makedirs('/content', exist_ok=True)
     CHECKPOINT_ROOT = '/kaggle/working/slam_results'
     os.makedirs(CHECKPOINT_ROOT, exist_ok=True)
     os.makedirs('/content/drive/MyDrive', exist_ok=True)
-    # Make '/content/drive/MyDrive/slam_results' resolve to /kaggle/working
     link = '/content/drive/MyDrive/slam_results'
-    if not os.path.exists(link):
-        os.symlink(CHECKPOINT_ROOT, link)
+    if not os.path.exists(link) and not os.path.islink(link):
+        try:
+            os.symlink(CHECKPOINT_ROOT, link)
+        except (OSError, NotImplementedError) as e:
+            # Fallback if the filesystem refuses symlinks: use a plain dir.
+            # A final cell at notebook end copies this to CHECKPOINT_ROOT.
+            print(f'Warning: symlink to {CHECKPOINT_ROOT} failed ({e}); using directory fallback.')
+            os.makedirs(link, exist_ok=True)
 
 else:
     raise RuntimeError(
@@ -142,6 +146,43 @@ for d in DIRS:
 
 print(f'Checkpoints: {CHECKPOINT_ROOT}')
 print(f'Disk free  : {shutil.disk_usage("/content").free / 1e9:.1f} GB at /content')
+""")
+
+# ---------------------------------------------------------------- Cell 1b
+md("""---
+## 0b. Restore build cache (if available)
+
+On Kaggle: `/kaggle/working/build_cache.tgz` persists across notebook commits.
+On Colab: uses `drive/MyDrive/slam_build_cache.tgz`.
+
+If the cache exists, we untar it into `/` and `/usr/local` — that restores the
+entire Pangolin / ORB-SLAM3 / Stella / DSO build tree in ~30 seconds, turning
+the ~30–40 min cold rebuild into a skip. If it doesn't exist, this cell is a
+no-op and cells 2–8 will build from source normally. After the first
+successful build, run the "snapshot build cache" cell below to populate it.
+""")
+
+code("""import os, subprocess
+
+if PLATFORM == 'kaggle':
+    BUILD_CACHE = '/kaggle/working/build_cache.tgz'
+elif PLATFORM == 'colab':
+    BUILD_CACHE = '/content/drive/MyDrive/slam_build_cache.tgz'
+else:
+    BUILD_CACHE = None
+
+if BUILD_CACHE and os.path.isfile(BUILD_CACHE) and not os.path.isdir('/content/ORB_SLAM3'):
+    sz = os.path.getsize(BUILD_CACHE) / 1e9
+    print(f'Restoring build cache from {BUILD_CACHE} ({sz:.2f} GB) ...')
+    subprocess.run(['tar', 'xzf', BUILD_CACHE, '-C', '/'], check=True)
+    subprocess.run(['ldconfig'], check=False)
+    print('Cache restored. Cells 4-8 will skip their build steps.')
+elif os.path.isdir('/content/ORB_SLAM3'):
+    print('Build tree already present in /content — nothing to restore.')
+else:
+    print(f'No build cache found at {BUILD_CACHE}.')
+    print('Cells 2-8 will build from source (~30-40 min).')
+    print('After that finishes, run the "snapshot build cache" cell to save it.')
 """)
 
 # ---------------------------------------------------------------- Cell 2
@@ -501,6 +542,55 @@ else
     echo '=== DSO build did not produce dso_dataset (graceful fallback engaged) ==='
     echo 'failed' > /content/dso_status/state
 fi
+""")
+
+# ---------------------------------------------------------------- Cell 8b
+md("""---
+## 6b. Snapshot build cache (run once, then leave disabled)
+
+After cells 2–8 have all succeeded at least once, flip `SAVE_BUILD_CACHE = True`
+in the cell below and run it. It tars up Pangolin / ORB-SLAM3 / Stella / DSO
+plus the `/usr/local` Pangolin install, and saves to either
+`/kaggle/working/build_cache.tgz` (Kaggle) or Drive (Colab).
+
+On subsequent sessions the "restore build cache" cell at the top will
+untar this in ~30 sec, skipping the 30–40 min rebuild.
+
+**Leave `SAVE_BUILD_CACHE = False` for normal runs** — re-tarring adds
+2–3 minutes and isn't needed unless you've changed the build.
+""")
+
+code(r"""%%bash
+SAVE_BUILD_CACHE=0   # set to 1 ONCE after a clean build, then back to 0
+
+if [ "$SAVE_BUILD_CACHE" != "1" ]; then
+    echo 'SAVE_BUILD_CACHE=0 — skipping snapshot.'
+    exit 0
+fi
+
+# Pick destination based on whether we're on Kaggle or Colab
+if [ -d /kaggle/working ]; then
+    CACHE=/kaggle/working/build_cache.tgz
+elif [ -d /content/drive/MyDrive ]; then
+    CACHE=/content/drive/MyDrive/slam_build_cache.tgz
+else
+    echo 'No persistent destination found.' >&2
+    exit 1
+fi
+
+mkdir -p "$(dirname "$CACHE")"
+echo "Snapshotting build tree to $CACHE ..."
+
+# -C / + relative paths avoids tar's "removing leading /" warnings.
+# Excludes strip the bulky object files we don't need for runtime.
+tar czf "$CACHE" \
+    --exclude='*.o' --exclude='*.obj' --exclude='.git' --exclude='Thirdparty/*/build/CMakeFiles' \
+    -C / \
+    $(cd / && ls -d content/Pangolin content/ORB_SLAM3 content/stella_vslam content/dso content/dso_status 2>/dev/null) \
+    $(cd / && ls -d usr/local/lib/libpango_*.so* usr/local/include/pangolin 2>/dev/null)
+
+SZ=$(du -h "$CACHE" | awk '{print $1}')
+echo "=== Snapshot saved: $CACHE ($SZ) ==="
 """)
 
 # ---------------------------------------------------------------- Cell 9
