@@ -1,13 +1,20 @@
-"""Generator for SLAM_Benchmark_EuRoC.ipynb.
+"""Generator for VO_Robustness_EuRoC.ipynb.
 
 Running this script emits the notebook file next to it. Kept as a script so the
-cell contents are readable as plain Python/bash rather than JSON-escaped blobs.
+cell contents are readable as plain Python rather than JSON-escaped blobs.
+
+Scope: rescoped project. The original plan was to benchmark ORB-SLAM3 /
+Stella-VSLAM / DSO under degraded conditions; build-system pain forced a
+pivot. The new experiment is a minimum-viable robustness study built on a
+pure-Python monocular VO pipeline with ORB and SIFT, run on EuRoC easy
+sequences under synthetic degradations (blur, low-light, noise). Everything
+is pip-installable; no C++ builds.
 """
 import json
 import pathlib
 import uuid
 
-OUT = pathlib.Path(__file__).parent / "SLAM_Benchmark_EuRoC.ipynb"
+OUT = pathlib.Path(__file__).parent / "VO_Robustness_EuRoC.ipynb"
 
 cells = []
 
@@ -33,866 +40,608 @@ def code(text):
     })
 
 # ---------------------------------------------------------------- Cell 0
-md("""# Visual SLAM Benchmarking Under Degraded Conditions
+md("""# Visual Odometry Robustness Under Degraded Conditions
 **16-833 Project — Sander Schulman**
 
-Benchmarks **ORB-SLAM3**, **Stella-VSLAM**, and **DSO** (best-effort) on six
-EuRoC MAV sequences spanning three difficulty levels. Runs on **Google Colab
-or Kaggle Notebooks** — the platform is auto-detected in cell 1.
+A minimal monocular visual odometry pipeline evaluated on EuRoC MAV
+sequences under synthetic perceptual degradations. Compares feature
+detectors (ORB vs SIFT) as the independent variable; the VO back-end is
+held constant.
 
-### How to use (Colab)
-1. **Runtime → Change runtime type → any CPU/GPU instance** (GPU not required, just gives more RAM).
-2. Run cells **in order**. Cold start build time: ~30–40 min.
-3. Cells are idempotent — after a session timeout, re-run from the top.
-4. Trajectory outputs are checkpointed to Google Drive after every sequence.
+### Why this scope
+The original proposal planned to benchmark three full SLAM systems
+(ORB-SLAM3, Stella-VSLAM, DSO). Weeks of effort on the C++ build chain
+(Pangolin, g2o, DBoW2, headless patches for Colab) did not produce a
+working pipeline. This rescope swaps the *systems* axis for a *feature
+detector* axis inside a single, controlled Python VO pipeline —
+answering essentially the same scientific question ("which algorithmic
+choices fail under which degradation?") with a tractable experiment.
 
-### How to use (Kaggle)
-1. **Settings panel → Accelerator: None** (or GPU for more RAM), **Internet: On**.
-2. Optional but recommended: attach the EuRoC MAV dataset as an input if you find
-   a public copy on Kaggle (search "EuRoC MAV"). Cell 9 will auto-use
-   `/kaggle/input/*euroc*/` if present; otherwise it falls back to wget.
-3. Run all. Use **"Save Version" → "Save & Run All (Commit)"** to execute in the
-   background — Kaggle will email you when it finishes and `/kaggle/working/`
-   outputs persist across sessions.
-4. Build tree lives in `/kaggle/temp` (wiped between sessions). Results live in
-   `/kaggle/working/slam_results` (persists across session restarts).
+### What runs here (local, Windows)
+- Python 3.11, all deps via `pip` (no compilation).
+- Downloads **MH_01_easy** and **V1_01_easy** from ETH (≈2.4 GB total).
+- Applies synthetic Gaussian blur, gamma darkening, and Gaussian noise
+  at three severities each.
+- Runs a 2-frame monocular VO (ORB or SIFT + essential matrix + recoverPose)
+  with GT-scaled per-step translation.
+- Scores every (detector × degradation × sequence) run with `evo_ape`
+  (ATE) and `evo_rpe` (RPE).
+- Classifies each run into a failure-mode bucket.
 
-### Pipeline
+### Limitations (called out in the writeup)
+- VO is up-to-scale; each relative translation is rescaled by the GT
+  inter-frame displacement magnitude (standard pedagogical shortcut,
+  e.g. Avi Singh's `monoVO-python`). We therefore measure
+  **direction + rotation accuracy** of the matcher, not scale recovery.
+- ATE uses Sim(3) alignment (`evo --correct_scale`); per-step scale
+  drift is averaged out. RPE is computed without scale correction.
+- No loop closure, no bundle adjustment — this is *odometry*, not SLAM.
+
+### Pipeline layout
 ```
-/content/
-├── Pangolin/           # built from source (ORB-SLAM3 dependency)
-├── ORB_SLAM3/          # built headless via xvfb
-├── stella_vslam/       # built headless
-├── dso/                # built best-effort; graceful fallback if it fails
-├── euroc/              # EuRoC sequences + converted TUM-format GT
-├── results/
-│   ├── orbslam3/  stella/  dso/   # per-system TUM trajectories
-│   └── eval/                      # evo ATE/RPE + combined JSON
-└── drive/MyDrive/slam_results/    # persistent checkpoint
+C:/Dev/slamproject/
+├── VO_Robustness_EuRoC.ipynb   ← this notebook
+├── data/
+│   └── euroc/
+│       ├── MH_01_easy/mav0/... (cam0 images + sensor.yaml + state_gt)
+│       └── V1_01_easy/mav0/...
+└── results/
+    ├── trajectories/           ← one TUM file per (seq, detector, degradation)
+    └── eval/                   ← evo zips + combined results JSON + plots
 ```
-
-### What is compliant with the midterm report
-- Three systems (DSO elevated from optional to primary) with graceful fallback.
-- Six EuRoC sequences (MH_{01,03,05}, V1_{01,02,03}).
-- Metrics: ATE RMSE, RPE RMSE, **tracking success rate**, **per-frame timing**.
-- Default parameters for all systems; Sim(3) alignment for monocular runs.
-- Median of N runs per sequence (N configurable via `QUICK_MODE`).
-- Auto-classified failure mode taxonomy.
 """)
 
 # ---------------------------------------------------------------- Cell 1
 md("""---
-## 0. Detect platform, mount persistent storage, create directories
+## 1. Install dependencies
 
-Auto-detects **Colab** vs **Kaggle**. On Kaggle we symlink `/content` → a
-scratch dir under `/kaggle/temp` and `/content/drive/MyDrive/slam_results` →
-`/kaggle/working/slam_results`, so every downstream cell's hardcoded
-`/content/...` paths work identically on both platforms.
+All pip wheels on Windows — no C++ toolchain needed.
+`opencv-contrib-python` (not `opencv-python`) is required because SIFT
+lives in `xfeatures2d`.
 """)
 
-code("""import os, shutil, sys
+code(r"""import subprocess, sys
 
-# ---- Platform detection ----
-if 'KAGGLE_KERNEL_RUN_TYPE' in os.environ or os.path.isdir('/kaggle/working'):
-    PLATFORM = 'kaggle'
-elif 'COLAB_GPU' in os.environ or os.path.isdir('/content'):
-    PLATFORM = 'colab'
-else:
-    PLATFORM = 'local'
-print(f'Platform: {PLATFORM}')
-
-if PLATFORM == 'colab':
-    from google.colab import drive
-    drive.mount('/content/drive')
-    CHECKPOINT_ROOT = '/content/drive/MyDrive/slam_results'
-
-elif PLATFORM == 'kaggle':
-    # Kaggle rootfs is an overlayfs that refuses os.symlink at '/', so we
-    # mkdir /content directly. Kaggle's session has ~73 GB of shared scratch
-    # across '/', /kaggle/temp, and /kaggle/working — plenty for the build
-    # tree + EuRoC. Checkpoints go to /kaggle/working/slam_results which
-    # persists across notebook commits (the only "saved" storage on Kaggle).
-    os.makedirs('/content', exist_ok=True)
-    CHECKPOINT_ROOT = '/kaggle/working/slam_results'
-    os.makedirs(CHECKPOINT_ROOT, exist_ok=True)
-    os.makedirs('/content/drive/MyDrive', exist_ok=True)
-    link = '/content/drive/MyDrive/slam_results'
-    if not os.path.exists(link) and not os.path.islink(link):
-        try:
-            os.symlink(CHECKPOINT_ROOT, link)
-        except (OSError, NotImplementedError) as e:
-            # Fallback if the filesystem refuses symlinks: use a plain dir.
-            # A final cell at notebook end copies this to CHECKPOINT_ROOT.
-            print(f'Warning: symlink to {CHECKPOINT_ROOT} failed ({e}); using directory fallback.')
-            os.makedirs(link, exist_ok=True)
-
-else:
-    raise RuntimeError(
-        'Unsupported platform. Run this notebook on Google Colab or Kaggle.')
-
-DIRS = [
-    '/content/euroc',
-    '/content/results/orbslam3',
-    '/content/results/stella',
-    '/content/results/dso',
-    '/content/results/eval',
-    '/content/drive/MyDrive/slam_results/orbslam3',
-    '/content/drive/MyDrive/slam_results/stella',
-    '/content/drive/MyDrive/slam_results/dso',
-    '/content/drive/MyDrive/slam_results/eval',
+PKGS = [
+    'opencv-contrib-python==4.10.0.84',
+    'numpy',
+    'pandas',
+    'matplotlib',
+    'pyyaml',
+    'tqdm',
+    'evo==1.28.0',
 ]
-for d in DIRS:
-    os.makedirs(d, exist_ok=True)
 
-print(f'Checkpoints: {CHECKPOINT_ROOT}')
-print(f'Disk free  : {shutil.disk_usage("/content").free / 1e9:.1f} GB at /content')
-""")
+def pip_install(pkgs):
+    cmd = [sys.executable, '-m', 'pip', 'install', '-q'] + pkgs
+    subprocess.run(cmd, check=True)
 
-# ---------------------------------------------------------------- Cell 1b
-md("""---
-## 0b. Restore build cache (if available)
+pip_install(PKGS)
 
-On Kaggle: `/kaggle/working/build_cache.tgz` persists across notebook commits.
-On Colab: uses `drive/MyDrive/slam_build_cache.tgz`.
-
-If the cache exists, we untar it into `/` and `/usr/local` — that restores the
-entire Pangolin / ORB-SLAM3 / Stella / DSO build tree in ~30 seconds, turning
-the ~30–40 min cold rebuild into a skip. If it doesn't exist, this cell is a
-no-op and cells 2–8 will build from source normally. After the first
-successful build, run the "snapshot build cache" cell below to populate it.
-""")
-
-code("""import os, subprocess
-
-if PLATFORM == 'kaggle':
-    BUILD_CACHE = '/kaggle/working/build_cache.tgz'
-elif PLATFORM == 'colab':
-    BUILD_CACHE = '/content/drive/MyDrive/slam_build_cache.tgz'
-else:
-    BUILD_CACHE = None
-
-if BUILD_CACHE and os.path.isfile(BUILD_CACHE) and not os.path.isdir('/content/ORB_SLAM3'):
-    sz = os.path.getsize(BUILD_CACHE) / 1e9
-    print(f'Restoring build cache from {BUILD_CACHE} ({sz:.2f} GB) ...')
-    subprocess.run(['tar', 'xzf', BUILD_CACHE, '-C', '/'], check=True)
-    subprocess.run(['ldconfig'], check=False)
-    print('Cache restored. Cells 4-8 will skip their build steps.')
-elif os.path.isdir('/content/ORB_SLAM3'):
-    print('Build tree already present in /content — nothing to restore.')
-else:
-    print(f'No build cache found at {BUILD_CACHE}.')
-    print('Cells 2-8 will build from source (~30-40 min).')
-    print('After that finishes, run the "snapshot build cache" cell to save it.')
+import cv2, numpy, evo
+print(f'OpenCV  : {cv2.__version__}')
+print(f'NumPy   : {numpy.__version__}')
+print(f'evo     : {evo.__version__ if hasattr(evo, "__version__") else "installed"}')
+assert hasattr(cv2, 'SIFT_create'), 'SIFT not found — install opencv-contrib-python, not opencv-python'
+print('SIFT    : OK')
 """)
 
 # ---------------------------------------------------------------- Cell 2
 md("""---
-## 1. Global configuration
+## 2. Configuration
 
-`QUICK_MODE = True` runs each sequence **once** (for end-to-end smoke tests).
-Set it to `False` for the full midterm protocol of **three runs per sequence**
-with median selection.
+`QUICK_MODE = True` runs a reduced sweep (≈10 min on a laptop) — one
+sequence, stride=3 (every third frame), 2 degradation levels. Flip to
+`False` for the full sweep used in the final report (~1 hour).
 """)
 
-code("""# ---- Global configuration ----
-QUICK_MODE = True   # True: 1 run/seq (~1h total); False: 3 runs/seq (~3-4h total)
+code(r"""from pathlib import Path
 
-NUM_RUNS = 1 if QUICK_MODE else 3
+ROOT         = Path(r'C:/Dev/slamproject')
+DATA_DIR     = ROOT / 'data' / 'euroc'
+RESULTS_DIR  = ROOT / 'results'
+TRAJ_DIR     = RESULTS_DIR / 'trajectories'
+EVAL_DIR     = RESULTS_DIR / 'eval'
+for d in (DATA_DIR, TRAJ_DIR, EVAL_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
-SEQUENCES = [
-    # (name, euroc_subfolder, difficulty)
-    ('MH_01_easy',       'machine_hall', 'easy'),
-    ('V1_01_easy',       'vicon_room1',  'easy'),
-    ('MH_03_medium',     'machine_hall', 'medium'),
-    ('V1_02_medium',     'vicon_room1',  'medium'),
-    ('MH_05_difficult',  'machine_hall', 'difficult'),
-    ('V1_03_difficult',  'vicon_room1',  'difficult'),
+QUICK_MODE = True
+
+SEQUENCES = ['MH_01_easy', 'V1_01_easy']
+DETECTORS = ['ORB', 'SIFT']
+
+# Frame stride — 1 = every frame, 3 = every 3rd (3x speedup, coarser trajectory)
+FRAME_STRIDE = 3 if QUICK_MODE else 1
+
+# Degradation sweep. Each entry: (label, kind, param).
+#   blur:  Gaussian blur kernel sigma (pixels).
+#   gamma: gamma > 1 -> darker; simulates low ambient light.
+#   noise: additive Gaussian noise sigma on [0, 255] range.
+DEGRADATIONS_FULL = [
+    ('clean',        None,    None),
+    ('blur_mild',    'blur',  2.0),
+    ('blur_medium',  'blur',  4.0),
+    ('blur_severe',  'blur',  8.0),
+    ('dark_mild',    'gamma', 1.8),
+    ('dark_medium',  'gamma', 2.8),
+    ('dark_severe',  'gamma', 4.5),
+    ('noise_mild',   'noise', 10.0),
+    ('noise_medium', 'noise', 25.0),
+    ('noise_severe', 'noise', 50.0),
 ]
-SEQ_NAMES = [s[0] for s in SEQUENCES]
+DEGRADATIONS_QUICK = [
+    ('clean',        None,    None),
+    ('blur_severe',  'blur',  8.0),
+    ('dark_severe',  'gamma', 4.5),
+    ('noise_severe', 'noise', 50.0),
+]
+DEGRADATIONS = DEGRADATIONS_QUICK if QUICK_MODE else DEGRADATIONS_FULL
 
-# Per-frame timing threshold below which we flag a "performance bottleneck"
-# (EuRoC cam0 is 20Hz = 50ms/frame, so >50ms means real-time can't be maintained)
-REALTIME_BUDGET_MS = 50.0
+# VO parameters
+N_FEATURES      = 2000       # max keypoints per frame
+LOWE_RATIO      = 0.75       # Lowe ratio test
+RANSAC_THRESH   = 1.0        # pixels, for findEssentialMat
+MIN_MATCHES     = 15         # below this, drop the frame (tracking fail)
+REALTIME_MS     = 50.0       # EuRoC cam0 runs at 20 Hz = 50 ms budget
 
-print(f'QUICK_MODE={QUICK_MODE}  NUM_RUNS={NUM_RUNS}  |  {len(SEQUENCES)} sequences')
+print(f'QUICK_MODE     : {QUICK_MODE}')
+print(f'Sequences      : {SEQUENCES if not QUICK_MODE else SEQUENCES[:1]}')
+print(f'Detectors      : {DETECTORS}')
+print(f'Degradations   : {[d[0] for d in DEGRADATIONS]}')
+print(f'Frame stride   : {FRAME_STRIDE}')
+run_seqs = SEQUENCES[:1] if QUICK_MODE else SEQUENCES
+total_runs = len(run_seqs) * len(DETECTORS) * len(DEGRADATIONS)
+print(f'Total runs     : {total_runs}')
 """)
 
 # ---------------------------------------------------------------- Cell 3
 md("""---
-## 2. Install system dependencies
-Shared deps for all three SLAM systems plus `xvfb` for headless rendering.
+## 3. Download EuRoC sequences
+
+Downloads each sequence as a zip, then unzips it. Skips any sequence
+already unpacked. ~1.2 GB per sequence.
+
+**Mirrors.** The official host (`robotics.ethz.ch`) has chronic
+multi-hour outages. We fall back to dated snapshots on the Wayback
+Machine (`web.archive.org`). Bytes are identical — the snapshot is
+just a read-through CDN capture of the same file. Wayback can stall
+for 60–90 s at the start of each request while it resolves the
+capture, so we use `curl -C -` (resumable, handles slow servers)
+and retry each URL a few times before moving to the next.
+
+Expect 5–15 minutes per sequence from the Wayback mirror.
 """)
 
-code(r"""%%bash
-set -e
-export DEBIAN_FRONTEND=noninteractive
+code(r"""import subprocess, shutil, zipfile, time
+from pathlib import Path
 
-echo '=== Installing apt dependencies ==='
-echo '--- All output shown inline for debugging ---'
-
-# Repair any broken/half-configured dpkg state
-dpkg --configure -a 2>&1 || true
-apt-get install -f -y -qq 2>&1 || true
-
-echo ''
-echo '>>> apt-get update'
-apt-get update -qq 2>&1
-
-echo ''
-echo '>>> Installing core packages (this is the slow step, ~3-5 min)...'
-apt-get install -y \
-    cmake gcc g++ git wget unzip pkg-config ca-certificates \
-    xvfb \
-    libeigen3-dev \
-    libopencv-dev libopencv-contrib-dev \
-    libglew-dev libwayland-dev libxkbcommon-dev \
-    libepoxy-dev \
-    libboost-all-dev \
-    libsuitesparse-dev \
-    libyaml-cpp-dev \
-    libssl-dev \
-    libgoogle-glog-dev libgflags-dev \
-    libspdlog-dev nlohmann-json3-dev \
-    libzip-dev libpng-dev \
-    python3-pip \
-    2>&1
-echo '>>> Core packages done.'
-
-# Packages that were renamed/split across Ubuntu versions
-apt_install_one() {
-    for pkg in "$@"; do
-        if apt-get install -y -qq "$pkg" 2>&1; then
-            return 0
-        fi
-    done
-    echo "WARNING: none of [$*] could be installed; continuing."
-    return 0
+# Each sequence -> list of URLs tried in order. First entry is the
+# authoritative ETH host; remaining entries are Wayback captures at
+# different timestamps (any one of which points at the same bytes,
+# but archive.org sometimes 404s a capture while serving another fine).
+EUROC_MIRRORS = {
+    'MH_01_easy': [
+        'http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/machine_hall/MH_01_easy/MH_01_easy.zip',
+        'https://web.archive.org/web/20230331114522/http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/machine_hall/MH_01_easy/MH_01_easy.zip',
+        'https://web.archive.org/web/2022/http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/machine_hall/MH_01_easy/MH_01_easy.zip',
+        'https://web.archive.org/web/2021/http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/machine_hall/MH_01_easy/MH_01_easy.zip',
+    ],
+    'V1_01_easy': [
+        'http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/vicon_room1/V1_01_easy/V1_01_easy.zip',
+        'https://web.archive.org/web/2023/http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/vicon_room1/V1_01_easy/V1_01_easy.zip',
+        'https://web.archive.org/web/2022/http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/vicon_room1/V1_01_easy/V1_01_easy.zip',
+        'https://web.archive.org/web/2021/http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset/vicon_room1/V1_01_easy/V1_01_easy.zip',
+    ],
 }
 
-echo ''
-echo '>>> Installing optional/renamed packages...'
-apt_install_one libgl-dev libgl1-mesa-dev
-apt_install_one libegl-dev libegl1-mesa-dev
-apt_install_one libc++-dev libc++-14-dev libc++-13-dev libc++-12-dev
-apt_install_one libjpeg-dev libjpeg-turbo8-dev libjpeg62-turbo-dev
+# Sanity-check sizes (bytes) — downloads smaller than this are treated as
+# a failed capture (404 HTML bodies, empty redirects, etc.)
+MIN_ZIP_BYTES = 100 * 1024 * 1024  # 100 MB
 
-echo ''
-echo '>>> Installing Python packages...'
-pip install -q 'evo==1.28.0' numpy matplotlib pandas tqdm
+def _try_curl(url, dst, attempts=3, connect_timeout=20, speed_low=1024, speed_time=120):
+    '''Resumable download with curl. Retries in-place on partial transfer.
+    Returns True on success.
 
-echo '--- Versions ---'
-echo "CMake  : $(cmake --version | head -1)"
-echo "GCC    : $(gcc --version | head -1)"
-python3 -c "import cv2; print(f'OpenCV : {cv2.__version__}')" || echo 'OpenCV : (python binding not installed — C++ libs only)'
-echo "Eigen  : $(pkg-config --modversion eigen3 2>/dev/null || echo '(headers at /usr/include/eigen3)')"
-echo "xvfb   : $(which xvfb-run)"
-echo '=== Done ==='
+    - `-C -` resumes at current file size, so partial transfers are retained
+      across retries.
+    - `--speed-limit/--speed-time` aborts if throughput drops below
+      `speed_low` B/s for `speed_time` s (catches frozen Wayback streams).
+    '''
+    for attempt in range(1, attempts + 1):
+        prefix = f'    [attempt {attempt}/{attempts}]'
+        cmd = [
+            'curl', '-L', '--fail',
+            '-C', '-',                                  # resume if partial
+            '--connect-timeout', str(connect_timeout),
+            '--speed-limit', str(speed_low),
+            '--speed-time',  str(speed_time),
+            '--retry', '0',
+            '-A', 'slamproject/1.0',
+            '-o', str(dst),
+            url,
+        ]
+        print(prefix, '->', url[:90] + ('...' if len(url) > 90 else ''))
+        t0 = time.time()
+        rc = subprocess.call(cmd)
+        dt = time.time() - t0
+        sz = dst.stat().st_size if dst.exists() else 0
+        print(f'{prefix} rc={rc}  size={sz/1e6:.1f} MB  elapsed={dt:.0f}s')
+        if rc == 0 and sz >= MIN_ZIP_BYTES:
+            return True
+        # Curl exit codes worth retrying the same URL on:
+        # 18=partial, 28=timeout, 56=recv failure, 92=HTTP/2 stream error
+        if rc in (18, 28, 56, 92):
+            print(f'{prefix} partial/timeout — will retry same URL')
+            continue
+        # Other failures: move on to next mirror
+        break
+    return False
+
+def download_with_fallback(seq, dst):
+    for i, url in enumerate(EUROC_MIRRORS[seq]):
+        host = url.split('/')[2]
+        print(f'  [mirror {i+1}/{len(EUROC_MIRRORS[seq])}] {host}')
+        if _try_curl(url, dst):
+            return url
+        print(f'  [mirror {i+1}] failed — trying next')
+        if dst.exists() and dst.stat().st_size < MIN_ZIP_BYTES:
+            dst.unlink()
+    raise RuntimeError(
+        f'All mirrors failed for {seq}. If this persists, download manually '
+        f'from https://projects.asl.ethz.ch/datasets/euroc-mav/ and place '
+        f'the zip at {dst}'
+    )
+
+run_seqs = SEQUENCES[:1] if QUICK_MODE else SEQUENCES
+for seq in run_seqs:
+    seq_dir = DATA_DIR / seq
+    if (seq_dir / 'mav0' / 'cam0' / 'data').is_dir():
+        n = len(list((seq_dir / 'mav0' / 'cam0' / 'data').glob('*.png')))
+        print(f'[SKIP] {seq}: already unpacked ({n} frames)')
+        continue
+
+    zip_path = DATA_DIR / f'{seq}.zip'
+    print(f'[DL]   {seq}')
+    t0 = time.time()
+    src_url = download_with_fallback(seq, zip_path)
+    print(f'[UNZIP] {seq}')
+    seq_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(seq_dir)
+    zip_path.unlink()
+    n = len(list((seq_dir / 'mav0' / 'cam0' / 'data').glob('*.png')))
+    print(f'[OK]   {seq}: {n} frames in {time.time()-t0:.0f}s  (from {src_url.split("/")[2]})')
 """)
 
 # ---------------------------------------------------------------- Cell 4
 md("""---
-## 3. Build Pangolin from source
+## 4. Load calibration + ground truth per sequence
 
-ORB-SLAM3's build hard-requires Pangolin. Ubuntu 22.04 has no apt package, so
-we build v0.6 (ORB-SLAM3-compatible) from source. We keep the viewer compiled
-but never create a window; instead we run the SLAM binary under `xvfb-run`.
+For each sequence: parse `sensor.yaml` for the pinhole intrinsics and
+radial-tangential distortion, and convert the Vicon ground-truth CSV
+to TUM format (`ts x y z qx qy qz qw`). GT is at 200 Hz; we keep full
+resolution and nearest-neighbour-lookup per cam0 timestamp at eval time.
 """)
 
-code(r"""%%bash
-set -e
-if [ -f /usr/local/lib/libpango_core.so ] || [ -f /usr/local/lib/libpango_core.a ]; then
-    echo 'Pangolin already installed, skipping.'
-    exit 0
-fi
+code(r"""import yaml
+import pandas as pd
+import numpy as np
 
-cd /content
-if [ ! -d Pangolin ]; then
-    git clone --depth 1 --branch v0.6 https://github.com/stevenlovegrove/Pangolin.git
-fi
-cd Pangolin
-rm -rf build   # start clean — a half-finished prior build will re-trigger the same errors
-mkdir -p build && cd build
+def load_calib(seq):
+    path = DATA_DIR / seq / 'mav0' / 'cam0' / 'sensor.yaml'
+    cfg  = yaml.safe_load(path.read_text())
+    fx, fy, cx, cy = cfg['intrinsics']
+    k1, k2, p1, p2 = cfg['distortion_coefficients']
+    W, H           = cfg['resolution']
+    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    D = np.array([k1, k2, p1, p2], dtype=np.float64)
+    return {'K': K, 'D': D, 'W': W, 'H': H}
 
-# BUILD_TOOLS=OFF skips Pangolin's VideoViewer / VideoConvert binaries. On
-# current Colab (Ubuntu 22.04), linking those fails with
-#   libGL.so: undefined reference to '_glapi_tls_Current'
-# because mesa's libGL doesn't carry an implicit libglapi link. ORB-SLAM3 only
-# needs the Pangolin *library*, which builds and installs cleanly without the
-# tools. BUILD_PANGOLIN_FFMPEG=OFF avoids another common v0.6 break on recent
-# ffmpeg. -Wno-error keeps picojson.h -Wparentheses warnings from failing the
-# build if -Werror is on.
-cmake .. \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_EXAMPLES=OFF \
-    -DBUILD_TESTS=OFF \
-    -DBUILD_TOOLS=OFF \
-    -DBUILD_PANGOLIN_PYTHON=OFF \
-    -DBUILD_PANGOLIN_FFMPEG=OFF \
-    -DCMAKE_CXX_FLAGS='-Wno-error -Wno-parentheses -Wno-deprecated-declarations' \
-    > /tmp/pangolin_cmake.log 2>&1 || { echo '--- cmake log (last 40 lines): ---'; tail -40 /tmp/pangolin_cmake.log; exit 1; }
+def euroc_gt_to_tum(seq, force=False):
+    src = DATA_DIR / seq / 'mav0' / 'state_groundtruth_estimate0' / 'data.csv'
+    dst = DATA_DIR / seq / 'gt.tum'
+    if dst.exists() and not force:
+        return dst
+    df = pd.read_csv(src, comment='#', header=None)
+    # EuRoC columns: ts(ns), px,py,pz, qw,qx,qy,qz, vx,vy,vz, wx,wy,wz, ax,ay,az
+    out = pd.DataFrame({
+        'ts': df.iloc[:, 0].astype('int64') / 1e9,
+        'x':  df.iloc[:, 1], 'y':  df.iloc[:, 2], 'z':  df.iloc[:, 3],
+        'qx': df.iloc[:, 5], 'qy': df.iloc[:, 6], 'qz': df.iloc[:, 7],
+        'qw': df.iloc[:, 4],
+    })
+    out.to_csv(dst, sep=' ', header=False, index=False, float_format='%.9f')
+    return dst
 
-make -j$(nproc) > /tmp/pangolin_build.log 2>&1 || { echo '--- make log (last 60 lines): ---'; tail -60 /tmp/pangolin_build.log; exit 1; }
-make install > /tmp/pangolin_install.log 2>&1 || { echo '--- install log: ---'; tail -40 /tmp/pangolin_install.log; exit 1; }
-ldconfig
-echo '=== Pangolin installed ==='
+def list_cam0_frames(seq):
+    img_dir = DATA_DIR / seq / 'mav0' / 'cam0' / 'data'
+    frames  = sorted(img_dir.glob('*.png'))
+    # EuRoC filenames are timestamps in nanoseconds
+    ts      = np.array([int(p.stem) / 1e9 for p in frames], dtype=np.float64)
+    return frames, ts
+
+run_seqs = SEQUENCES[:1] if QUICK_MODE else SEQUENCES
+SEQ_META = {}
+for seq in run_seqs:
+    calib = load_calib(seq)
+    gt_path = euroc_gt_to_tum(seq)
+    frames, ts = list_cam0_frames(seq)
+    gt_df = pd.read_csv(gt_path, sep=' ', header=None,
+                        names=['ts','x','y','z','qx','qy','qz','qw'])
+    SEQ_META[seq] = {'calib': calib, 'gt_path': gt_path, 'gt_df': gt_df,
+                     'frames': frames, 'ts': ts}
+    print(f'{seq}: {len(frames)} cam0 frames, {len(gt_df)} GT poses, '
+          f'K={calib["K"][0,0]:.1f}|{calib["K"][1,1]:.1f}')
 """)
 
 # ---------------------------------------------------------------- Cell 5
 md("""---
-## 4. Build ORB-SLAM3
+## 5. Degradation functions
 
-Builds the official repo with only two minimal patches (C++14 for modern GCC,
-Eigen alignment in `LoopClosing.h`). The viewer stays compiled — we run under
-`xvfb-run` so it never actually pops a window.
+Each function takes a grayscale `uint8` image and returns a degraded
+`uint8` image of the same shape.
+
+- **Gaussian blur** — proxies motion blur at increasing severity.
+- **Gamma darkening** — `out = 255 * (in/255)^γ`, γ > 1 reduces midtones,
+  simulates low ambient light.
+- **Gaussian noise** — additive zero-mean noise, simulates high sensor gain.
 """)
 
-code(r"""%%bash
-set -e
-cd /content
+code(r"""import cv2
+import numpy as np
 
-if [ -f /content/ORB_SLAM3/Examples/Monocular/mono_euroc ]; then
-    echo 'ORB-SLAM3 already built, skipping.'
-    exit 0
-fi
+_rng = np.random.default_rng(42)
 
-echo '=== Cloning ORB-SLAM3 ==='
-if [ ! -d /content/ORB_SLAM3 ]; then
-    git clone --depth 1 https://github.com/UZ-SLAMLab/ORB_SLAM3.git /content/ORB_SLAM3
-fi
-cd /content/ORB_SLAM3
+def degrade(img, kind, param):
+    '''img: uint8 grayscale. Returns uint8 grayscale.'''
+    if kind is None:
+        return img
+    if kind == 'blur':
+        ksize = max(3, int(2 * round(3 * param) + 1))
+        return cv2.GaussianBlur(img, (ksize, ksize), param)
+    if kind == 'gamma':
+        lut = np.power(np.arange(256) / 255.0, param) * 255.0
+        return cv2.LUT(img, lut.astype(np.uint8))
+    if kind == 'noise':
+        noise = _rng.normal(0, param, img.shape)
+        return np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    raise ValueError(f'unknown degradation kind {kind!r}')
 
-# Patch 1: C++14 (top-level + Thirdparty)
-sed -i 's/set(CMAKE_CXX_STANDARD 11)/set(CMAKE_CXX_STANDARD 14)/' CMakeLists.txt
-find Thirdparty -name CMakeLists.txt -exec sed -i 's/set(CMAKE_CXX_STANDARD 11)/set(CMAKE_CXX_STANDARD 14)/' {} \;
 
-# Patch 2: Eigen alignment in LoopClosing.h (prevents segfault under newer Eigen)
-if ! grep -q 'EIGEN_MAKE_ALIGNED_OPERATOR_NEW' include/LoopClosing.h; then
-    python3 - <<'PYEOF'
-import re, pathlib
-p = pathlib.Path('include/LoopClosing.h')
-src = p.read_text()
-# Insert macro right after the first `public:` inside the LoopClosing class
-patched = re.sub(
-    r'(class LoopClosing[^{]*\{[^}]*?public:\s*)',
-    r'\1\n    EIGEN_MAKE_ALIGNED_OPERATOR_NEW\n',
-    src, count=1, flags=re.DOTALL)
-p.write_text(patched)
-print('Patched LoopClosing.h')
-PYEOF
-fi
+# --- visual sanity check ---
+import matplotlib.pyplot as plt
 
-# Use the build script the repo ships with; it handles Thirdparty (DBoW2, g2o, Sophus) + main
-chmod +x build.sh
-./build.sh 2>&1 | tail -30
+seq0 = list(SEQ_META)[0]
+sample = cv2.imread(str(SEQ_META[seq0]['frames'][200]), cv2.IMREAD_GRAYSCALE)
 
-if [ -f /content/ORB_SLAM3/Examples/Monocular/mono_euroc ]; then
-    echo '=== ORB-SLAM3 BUILD SUCCESSFUL ==='
-else
-    echo '=== ORB-SLAM3 BUILD FAILED — see output above ==='
-    exit 1
-fi
+fig, axes = plt.subplots(1, len(DEGRADATIONS), figsize=(3 * len(DEGRADATIONS), 3))
+if len(DEGRADATIONS) == 1:
+    axes = [axes]
+for ax, (label, kind, param) in zip(axes, DEGRADATIONS):
+    d = degrade(sample, kind, param)
+    ax.imshow(d, cmap='gray', vmin=0, vmax=255)
+    ax.set_title(label, fontsize=9)
+    ax.axis('off')
+plt.tight_layout()
+plt.savefig(EVAL_DIR / 'degradation_examples.png', dpi=120, bbox_inches='tight')
+plt.show()
 """)
 
 # ---------------------------------------------------------------- Cell 6
 md("""---
-## 5. Build Stella-VSLAM
+## 6. Monocular VO pipeline
 
-Stella-VSLAM (community maintained fork of OpenVSLAM). Headless build with
-Pangolin viewer and socket publisher both disabled.
+2-frame essential-matrix VO:
+
+1. Load frame *i*, undistort with sequence intrinsics + distortion.
+2. Apply degradation (if any) in the undistorted image plane.
+3. Detect + describe keypoints with the chosen detector.
+4. Match to the previous successfully-tracked frame with BFMatcher +
+   Lowe ratio test.
+5. `findEssentialMat` (RANSAC) then `recoverPose` → relative rotation `R`
+   and unit-norm translation direction `t`.
+6. Scale `t` by the GT inter-frame translation magnitude between the
+   two frames (nearest GT timestamp lookup). This is the pedagogical
+   shortcut that lets us measure matcher quality rather than
+   scale-recovery quality.
+7. Chain into a cumulative pose; emit one TUM row per tracked frame.
+
+If any step fails (too few matches, degenerate `E`), the frame is
+*dropped*: the previous reference stays put and we try again next frame.
+The fraction of frames that produce a pose is the **tracking success rate**.
 """)
 
-code(r"""%%bash
-# Cell 5: Build Stella-VSLAM (robust, fully verbose inline)
-#
-# Key design points after multiple iterations:
-#   * Source-build g2o: Ubuntu's libg2o-dev does NOT ship g2oConfig.cmake,
-#     which stella's find_package(g2o CONFIG) requires. So we source-build
-#     g2o from RainerKuemmerle/g2o unconditionally (unless already built).
-#   * Upstream stella_vslam split example binaries (run_euroc_slam etc.)
-#     into a separate repo (stella-cv/stella_vslam_examples). We build
-#     stella_vslam itself, install it, then build the examples repo
-#     against the installed library.
-#   * All cmake/make output goes inline to stdout (no > log files). Earlier
-#     revisions redirected to /tmp and used tail-on-failure, but the log
-#     tail occasionally didn't reach the notebook - streaming the build
-#     output directly makes failures unmissable.
-#   * rm -rf build before every cmake so stale CMakeCache doesn't poison
-#     a retry.
-#   * -Wno-error when building 3rd/FBoW (FBoW's -Werror trips on gcc 11+
-#     deprecation warnings).
-#   * On any failure: write /content/stella_status/state=failed and exit 0,
-#     so the pipeline continues and cell 11 skips Stella gracefully.
-exec 2>&1
-set +e
+code(r"""import cv2, time, numpy as np
+from scipy.spatial.transform import Rotation as Rscipy
 
-STATE_DIR=/content/stella_status
-mkdir -p "$STATE_DIR"
-STATE_FILE="$STATE_DIR/state"
+def _create_detector(name):
+    if name == 'ORB':
+        return cv2.ORB_create(nfeatures=N_FEATURES), cv2.NORM_HAMMING
+    if name == 'SIFT':
+        return cv2.SIFT_create(nfeatures=N_FEATURES), cv2.NORM_L2
+    raise ValueError(name)
 
-fail() {
-    echo ""
-    echo "=== STELLA BUILD FAILED: $1 ==="
-    echo "failed: $1" > "$STATE_FILE"
-    echo "(cell 11 will detect the missing binary and skip Stella runs)"
-    exit 0
-}
+def _nearest_gt_pos(gt_df, ts):
+    # returns (x,y,z) at the GT row whose timestamp is closest to ts
+    i = int(np.argmin(np.abs(gt_df['ts'].values - ts)))
+    r = gt_df.iloc[i]
+    return np.array([r['x'], r['y'], r['z']], dtype=np.float64)
 
-STELLA=/content/stella_vslam
-EXAMPLES=/content/stella_vslam_examples
+def run_vo(seq, detector_name, degradation, stride=1, verbose=False):
+    '''Returns (tum_rows, stats) where tum_rows is a list of
+    [ts, x, y, z, qx, qy, qz, qw] and stats is a dict.'''
+    meta   = SEQ_META[seq]
+    K, D   = meta['calib']['K'], meta['calib']['D']
+    frames = meta['frames'][::stride]
+    ts_all = meta['ts'][::stride]
+    gt_df  = meta['gt_df']
+    det, norm = _create_detector(detector_name)
+    bf = cv2.BFMatcher(norm, crossCheck=False)
 
-if find "$EXAMPLES/build" "$STELLA/build" -name 'run_euroc*' -type f -executable 2>/dev/null | grep -q .; then
-    echo 'Stella-VSLAM already built, skipping.'
-    echo 'ok' > "$STATE_FILE"
-    exit 0
-fi
+    tum_rows = []
+    # Cumulative camera pose in world frame (cam0 = world origin)
+    R_cum = np.eye(3)
+    t_cum = np.zeros(3)
 
-echo '=============================================================='
-echo '>>> [1/7] Installing g2o from source'
-echo '=============================================================='
-echo '    (Ubuntu libg2o-dev does not ship g2oConfig.cmake, which'
-echo '     stella_vslam requires via find_package(g2o CONFIG).)'
+    # First frame is the anchor: emit identity pose.
+    first_img = cv2.imread(str(frames[0]), cv2.IMREAD_GRAYSCALE)
+    first_img = cv2.undistort(first_img, K, D)
+    first_img = degrade(first_img, degradation[1], degradation[2])
+    prev_kp, prev_des = det.detectAndCompute(first_img, None)
+    prev_ts = ts_all[0]
+    prev_gt_pos = _nearest_gt_pos(gt_df, prev_ts)
+    q = Rscipy.from_matrix(R_cum).as_quat()  # xyzw
+    tum_rows.append([prev_ts, *t_cum.tolist(), *q.tolist()])
 
-if [ -f /usr/local/lib/cmake/g2o/g2oConfig.cmake ]; then
-    echo '  g2oConfig.cmake already installed at /usr/local/lib/cmake/g2o/, skipping.'
-else
-    if [ ! -d /content/g2o ]; then
-        echo '  Cloning g2o...'
-        git clone --depth 1 https://github.com/RainerKuemmerle/g2o.git /content/g2o \
-            || fail 'g2o git clone failed'
-    fi
-    rm -rf /content/g2o/build
-    mkdir -p /content/g2o/build
-    cd /content/g2o/build
-    echo '  Running g2o cmake...'
-    cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_MARCH_NATIVE=OFF \
-        -DG2O_USE_OPENGL=OFF -DG2O_BUILD_APPS=OFF -DG2O_BUILD_EXAMPLES=OFF \
-        || fail 'g2o cmake failed (see output above)'
-    echo '  Compiling g2o...'
-    make -j$(nproc) || fail 'g2o make failed (see output above)'
-    echo '  Installing g2o...'
-    make install > /tmp/g2o_install.log 2>&1 || sudo make install > /tmp/g2o_install.log 2>&1
-    if [ ! -f /usr/local/lib/cmake/g2o/g2oConfig.cmake ]; then
-        echo '  g2o install output (last 30 lines):'
-        tail -30 /tmp/g2o_install.log
-        fail 'g2o install did not produce g2oConfig.cmake'
-    fi
-    ldconfig 2>/dev/null || true
-    echo '  g2o installed successfully.'
-fi
+    n_total    = len(frames) - 1   # pairs attempted
+    n_tracked  = 0                 # pairs that emitted a pose
+    n_low_match = 0
+    n_bad_E    = 0
+    t_start = time.time()
 
-echo ''
-echo '=============================================================='
-echo '>>> [2/7] Cloning stella_vslam'
-echo '=============================================================='
-if [ ! -d "$STELLA" ]; then
-    git clone --recursive --depth 1 https://github.com/stella-cv/stella_vslam.git "$STELLA" \
-        || fail 'git clone of stella_vslam failed'
-fi
-cd "$STELLA" || fail "cd $STELLA failed"
-git submodule update --init --recursive || true
+    for i in range(1, len(frames)):
+        img = cv2.imread(str(frames[i]), cv2.IMREAD_GRAYSCALE)
+        img = cv2.undistort(img, K, D)
+        img = degrade(img, degradation[1], degradation[2])
+        kp, des = det.detectAndCompute(img, None)
+        cur_ts  = ts_all[i]
 
-echo ''
-echo '=============================================================='
-echo '>>> [3/7] Building bundled 3rd-party (FBoW)'
-echo '=============================================================='
-for sub in 3rd/FBoW 3rd/fbow; do
-    if [ -d "$STELLA/$sub" ]; then
-        echo "  --- $sub ---"
-        rm -rf "$STELLA/$sub/build"
-        mkdir -p "$STELLA/$sub/build"
-        cd "$STELLA/$sub/build" || fail "cd $sub/build failed"
-        echo "  Running cmake in $sub..."
-        cmake .. -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS='-Wno-error -Wno-deprecated-declarations' \
-            || fail "$sub cmake failed (see output above)"
-        echo "  Compiling $sub..."
-        make -j$(nproc) || fail "$sub make failed (see output above)"
-        echo "  Installing $sub..."
-        make install > /tmp/sub_install.log 2>&1 || sudo make install > /tmp/sub_install.log 2>&1
-        if [ $? -ne 0 ]; then
-            echo "  $sub install output (last 20 lines):"
-            tail -20 /tmp/sub_install.log
-            fail "$sub install failed"
-        fi
-    fi
-done
-ldconfig 2>/dev/null || true
+        if des is None or prev_des is None or len(kp) < MIN_MATCHES:
+            n_low_match += 1
+            continue
 
-echo ''
-echo '=============================================================='
-echo '>>> [4/7] Configuring stella_vslam (cmake)'
-echo '=============================================================='
-echo '    (Note: BUILD_EXAMPLES / USE_PANGOLIN_VIEWER / USE_SOCKET_PUBLISHER'
-echo '     / USE_STACK_TRACE_LOGGER are NOT options on stella_vslam itself'
-echo '     anymore - examples were extracted into stella_vslam_examples.)'
-cd "$STELLA" || fail "cd $STELLA failed"
-rm -rf build
-mkdir -p build && cd build
-cmake .. \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_TESTS=OFF \
-    -DCMAKE_CXX_FLAGS='-Wno-error -Wno-deprecated-declarations' \
-    || fail 'stella cmake failed (see output above)'
+        pairs = bf.knnMatch(prev_des, des, k=2)
+        good = [p[0] for p in pairs
+                if len(p) == 2 and p[0].distance < LOWE_RATIO * p[1].distance]
+        if len(good) < MIN_MATCHES:
+            n_low_match += 1
+            continue
 
-echo ''
-echo '=============================================================='
-echo '>>> [5/7] Compiling + installing stella_vslam (longest step, ~5-15 min)'
-echo '=============================================================='
-make -j$(nproc) || fail 'stella make failed (see output above)'
-echo '  Installing stella_vslam (so the examples repo can find_package it)...'
-make install > /tmp/stella_install.log 2>&1 || sudo make install > /tmp/stella_install.log 2>&1
-if [ ! -f /usr/local/lib/cmake/stella_vslam/stella_vslamConfig.cmake ]; then
-    echo '  stella install output (last 30 lines):'
-    tail -30 /tmp/stella_install.log
-    fail 'stella install did not produce stella_vslamConfig.cmake'
-fi
-ldconfig 2>/dev/null || true
+        pts_prev = np.float32([prev_kp[m.queryIdx].pt for m in good])
+        pts_cur  = np.float32([kp[m.trainIdx].pt      for m in good])
 
-echo ''
-echo '=============================================================='
-echo '>>> [6/7] Cloning + building stella_vslam_examples (provides run_euroc_slam)'
-echo '=============================================================='
-if [ ! -d "$EXAMPLES" ]; then
-    echo '  Cloning stella_vslam_examples...'
-    git clone --recursive --depth 1 https://github.com/stella-cv/stella_vslam_examples.git "$EXAMPLES" \
-        || fail 'git clone of stella_vslam_examples failed'
-fi
-cd "$EXAMPLES" || fail "cd $EXAMPLES failed"
-git submodule update --init --recursive || true
-rm -rf build
-mkdir -p build && cd build
-echo '  Running examples cmake (no viewers - headless)...'
-cmake .. \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DUSE_STACK_TRACE_LOGGER=OFF \
-    -DCMAKE_CXX_FLAGS='-Wno-error -Wno-deprecated-declarations' \
-    || fail 'stella_vslam_examples cmake failed (see output above)'
-echo '  Compiling stella_vslam_examples...'
-make -j$(nproc) || fail 'stella_vslam_examples make failed (see output above)'
+        E, mask = cv2.findEssentialMat(
+            pts_prev, pts_cur, K, method=cv2.RANSAC,
+            prob=0.999, threshold=RANSAC_THRESH)
+        if E is None or E.shape != (3, 3):
+            n_bad_E += 1
+            continue
 
-echo ''
-echo '=============================================================='
-echo '>>> [7/7] Locating run_euroc_slam binary'
-echo '=============================================================='
-STELLA_BIN=$(find "$EXAMPLES/build" "$STELLA/build" -name 'run_euroc*' -type f -executable 2>/dev/null | head -1)
-if [ -z "$STELLA_BIN" ]; then
-    echo 'cmake+make succeeded but no run_euroc* binary.'
-    echo 'Executables under examples/build/:'
-    find "$EXAMPLES/build" -type f -executable 2>/dev/null | head -20
-    fail 'no run_euroc* binary (example target may have been renamed upstream)'
-fi
-echo "=== STELLA-VSLAM BUILD SUCCESSFUL ==="
-echo "Binary: $STELLA_BIN"
-echo 'ok' > "$STATE_FILE"
+        n_in, R_rel, t_rel, _ = cv2.recoverPose(E, pts_prev, pts_cur, K, mask=mask)
+        if n_in < MIN_MATCHES:
+            n_bad_E += 1
+            continue
+
+        cur_gt_pos = _nearest_gt_pos(gt_df, cur_ts)
+        scale      = float(np.linalg.norm(cur_gt_pos - prev_gt_pos))
+
+        # Chain: R_cum and t_cum describe camera pose in world frame.
+        # recoverPose returns (R_rel, t_rel) mapping prev-cam coords -> cur-cam coords.
+        # So the cur-cam origin, expressed in prev-cam frame, is -R_rel^T @ t_rel.
+        t_unit_in_prev = -R_rel.T @ t_rel.ravel()
+        t_cum = t_cum + R_cum @ (scale * t_unit_in_prev)
+        R_cum = R_cum @ R_rel.T
+
+        q = Rscipy.from_matrix(R_cum).as_quat()  # xyzw
+        tum_rows.append([cur_ts, *t_cum.tolist(), *q.tolist()])
+
+        prev_kp, prev_des = kp, des
+        prev_ts    = cur_ts
+        prev_gt_pos = cur_gt_pos
+        n_tracked  += 1
+
+    wall_s  = time.time() - t_start
+    stats = {
+        'n_frames_input': len(frames),
+        'n_pairs':        n_total,
+        'n_tracked':      n_tracked,
+        'n_low_match':    n_low_match,
+        'n_bad_E':        n_bad_E,
+        'tracking_rate':  (n_tracked / n_total) if n_total else 0.0,
+        'wall_s':         wall_s,
+        'per_frame_ms':   (wall_s * 1000.0 / len(frames)) if frames else None,
+    }
+    return tum_rows, stats
+
+def write_tum(path, rows):
+    with open(path, 'w') as f:
+        for r in rows:
+            f.write(' '.join(f'{v:.9f}' for v in r) + '\n')
+
+# smoke test: quick run on the first few hundred frames
+_seq = list(SEQ_META)[0]
+_rows, _stats = run_vo(_seq, 'ORB', ('clean', None, None), stride=max(FRAME_STRIDE, 5))
+print(f'Smoke test ({_seq}, ORB, clean, stride=5):')
+for k, v in _stats.items():
+    print(f'  {k:16s} = {v}')
+print(f'  rows written    = {len(_rows)}')
 """)
 
 # ---------------------------------------------------------------- Cell 7
-md("""### 5b. Download Stella-VSLAM FBoW vocabulary
+md("""---
+## 7. Run the full sweep
+
+One TUM file per `(sequence, detector, degradation)` cell in
+`results/trajectories/`. All runs together should finish in ≈10 min
+under `QUICK_MODE` or ~1 h for the full sweep.
 """)
 
-code(r"""%%bash
-set -e
-VOCAB_DIR=/content/stella_vslam/vocab
-mkdir -p $VOCAB_DIR
-if [ -s $VOCAB_DIR/orb_vocab.fbow ]; then
-    echo 'Vocab already present.'
-    exit 0
-fi
+code(r"""import json
+from tqdm.auto import tqdm
 
-# Primary source: Stella's own FBoW vocab repo
-wget -q -O $VOCAB_DIR/orb_vocab.fbow \
-    https://github.com/stella-cv/FBoW_orb_vocab/raw/main/orb_vocab.fbow || true
+run_seqs = SEQUENCES[:1] if QUICK_MODE else SEQUENCES
 
-if [ ! -s $VOCAB_DIR/orb_vocab.fbow ]; then
-    # Fallback: release asset
-    wget -q -O $VOCAB_DIR/orb_vocab.fbow \
-        https://github.com/stella-cv/FBoW_orb_vocab/releases/download/v1.0/orb_vocab.fbow || true
-fi
+sweep_log = []
+triples = [(s, d, deg) for s in run_seqs for d in DETECTORS for deg in DEGRADATIONS]
 
-if [ -s $VOCAB_DIR/orb_vocab.fbow ]; then
-    echo "Vocab downloaded: $(ls -lh $VOCAB_DIR/orb_vocab.fbow | awk '{print $5}')"
-else
-    echo 'WARNING: Stella vocab download failed. Stella runs will be skipped.'
-    exit 0   # don't fail the whole pipeline
-fi
+for seq, detector, deg in tqdm(triples, desc='VO sweep'):
+    label = deg[0]
+    out_path = TRAJ_DIR / f'{seq}__{detector}__{label}.tum'
+    if out_path.exists() and out_path.stat().st_size > 0:
+        # idempotent: skip completed cells when re-running
+        n_rows = sum(1 for _ in open(out_path))
+        sweep_log.append({
+            'seq': seq, 'detector': detector, 'degradation': label,
+            'traj_path': str(out_path), 'n_rows': n_rows, 'skipped': True,
+        })
+        continue
+
+    rows, stats = run_vo(seq, detector, deg, stride=FRAME_STRIDE)
+    write_tum(out_path, rows)
+    sweep_log.append({
+        'seq': seq, 'detector': detector, 'degradation': label,
+        'traj_path': str(out_path), 'n_rows': len(rows), 'skipped': False,
+        **stats,
+    })
+
+log_path = EVAL_DIR / 'sweep_log.json'
+log_path.write_text(json.dumps(sweep_log, indent=2))
+print(f'\nWrote {len(sweep_log)} entries to {log_path}')
 """)
 
 # ---------------------------------------------------------------- Cell 8
 md("""---
-## 6. Build DSO (best-effort)
+## 8. Evaluate every run with `evo`
 
-DSO doesn't ship a EuRoC runner or photometric calibration. We build Engel's
-reference implementation with a few modern-Ubuntu compatibility patches, then
-later generate a `camera.txt` from each sequence's `sensor.yaml` and run with
-`mode=1` (online photometric optimization — no `pcalib.txt`/`vignette` needed).
-
-If the build fails for any reason, we annotate a failure record and the rest
-of the pipeline continues without DSO.
+`evo_ape` with `--align --correct_scale` (Sim(3) alignment) for ATE.
+`evo_rpe` *without* scale correction for RPE (local per-step metric;
+scale correction isn't meaningful for it).
 """)
 
-code(r"""%%bash
-set -e
-mkdir -p /content/dso_status
-
-if [ -f /content/dso/build/bin/dso_dataset ]; then
-    echo 'DSO already built.'
-    echo 'ok' > /content/dso_status/state
-    exit 0
-fi
-
-(
-    cd /content
-    if [ ! -d dso ]; then
-        git clone --depth 1 https://github.com/JakobEngel/dso.git
-    fi
-    cd dso
-
-    # ---- Patches for modern Ubuntu / GCC ----
-    # Bump C++ standard (DSO default is C++11; newer GCC versions need C++14 for <limits> dependents)
-    sed -i 's/-std=c++0x/-std=c++14/g; s/-std=c++11/-std=c++14/g' CMakeLists.txt || true
-
-    # Add missing <limits> include if GCC complains (only patch files that don't already have it)
-    for f in src/util/NumType.h src/util/settings.h; do
-        if [ -f "$f" ] && ! grep -q '<limits>' "$f"; then
-            sed -i '1i #include <limits>' "$f" 2>/dev/null || true
-        fi
-    done
-
-    mkdir -p build && cd build
-    cmake .. -DCMAKE_BUILD_TYPE=Release > /tmp/dso_cmake.log 2>&1 || {
-        echo '--- DSO cmake failed (last 20 lines): ---'
-        tail -20 /tmp/dso_cmake.log
-        exit 1
-    }
-    make -j$(nproc) > /tmp/dso_build.log 2>&1 || {
-        echo '--- DSO build failed (last 30 lines): ---'
-        tail -30 /tmp/dso_build.log
-        exit 1
-    }
-)
-
-if [ -f /content/dso/build/bin/dso_dataset ]; then
-    echo '=== DSO BUILD SUCCESSFUL ==='
-    echo 'ok' > /content/dso_status/state
-else
-    echo '=== DSO build did not produce dso_dataset (graceful fallback engaged) ==='
-    echo 'failed' > /content/dso_status/state
-fi
-""")
-
-# ---------------------------------------------------------------- Cell 8b
-md("""---
-## 6b. Snapshot build cache (run once, then leave disabled)
-
-After cells 2–8 have all succeeded at least once, flip `SAVE_BUILD_CACHE = True`
-in the cell below and run it. It tars up Pangolin / ORB-SLAM3 / Stella / DSO
-plus the `/usr/local` Pangolin install, and saves to either
-`/kaggle/working/build_cache.tgz` (Kaggle) or Drive (Colab).
-
-On subsequent sessions the "restore build cache" cell at the top will
-untar this in ~30 sec, skipping the 30–40 min rebuild.
-
-**Leave `SAVE_BUILD_CACHE = False` for normal runs** — re-tarring adds
-2–3 minutes and isn't needed unless you've changed the build.
-""")
-
-code(r"""%%bash
-SAVE_BUILD_CACHE=0   # set to 1 ONCE after a clean build, then back to 0
-
-if [ "$SAVE_BUILD_CACHE" != "1" ]; then
-    echo 'SAVE_BUILD_CACHE=0 — skipping snapshot.'
-    exit 0
-fi
-
-# Pick destination based on whether we're on Kaggle or Colab
-if [ -d /kaggle/working ]; then
-    CACHE=/kaggle/working/build_cache.tgz
-elif [ -d /content/drive/MyDrive ]; then
-    CACHE=/content/drive/MyDrive/slam_build_cache.tgz
-else
-    echo 'No persistent destination found.' >&2
-    exit 1
-fi
-
-mkdir -p "$(dirname "$CACHE")"
-echo "Snapshotting build tree to $CACHE ..."
-
-# -C / + relative paths avoids tar's "removing leading /" warnings.
-# Excludes strip the bulky object files we don't need for runtime.
-tar czf "$CACHE" \
-    --exclude='*.o' --exclude='*.obj' --exclude='.git' --exclude='Thirdparty/*/build/CMakeFiles' \
-    -C / \
-    $(cd / && ls -d content/Pangolin content/ORB_SLAM3 content/stella_vslam content/dso content/dso_status 2>/dev/null) \
-    $(cd / && ls -d usr/local/lib/libpango_*.so* usr/local/include/pangolin 2>/dev/null)
-
-SZ=$(du -h "$CACHE" | awk '{print $1}')
-echo "=== Snapshot saved: $CACHE ($SZ) ==="
-""")
-
-# ---------------------------------------------------------------- Cell 9
-md("""---
-## 7. Download EuRoC sequences
-
-Downloads the six-sequence subset defined in Section V.B of the midterm:
-- **Easy (baseline)**: `MH_01_easy`, `V1_01_easy`
-- **Medium**: `MH_03_medium`, `V1_02_medium`
-- **Difficult (severe degradation)**: `MH_05_difficult`, `V1_03_difficult`
-
-Skips sequences already on disk.
-""")
-
-code(r"""import os, subprocess, shutil, glob
-
-EUROC_BASE = 'http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset'
-DEST       = '/content/euroc'
-
-# ---- Kaggle: check if a EuRoC dataset is already attached as an input ----
-# If a user attached a public EuRoC MAV dataset to the notebook, symlink its
-# sequence folders into /content/euroc instead of re-downloading (~10 min saved).
-def _try_kaggle_input():
-    found = {}
-    candidates = glob.glob('/kaggle/input/*/**/mav0', recursive=True)
-    for mav0 in candidates:
-        # Sequence name is the parent dir of mav0/
-        seq_dir = os.path.dirname(mav0)
-        seq_name = os.path.basename(seq_dir)
-        found[seq_name] = seq_dir
-    return found
-
-kaggle_map = _try_kaggle_input() if os.path.isdir('/kaggle/input') else {}
-if kaggle_map:
-    print(f'[KAGGLE] Found {len(kaggle_map)} EuRoC sequences in /kaggle/input — using those.')
-
-for seq_name, subfolder, _ in SEQUENCES:
-    target = f'{DEST}/{seq_name}'
-    if os.path.isdir(f'{target}/mav0'):
-        print(f'[SKIP] {seq_name} already downloaded')
-        continue
-
-    # Kaggle fast path: symlink the attached dataset's sequence folder
-    if seq_name in kaggle_map:
-        os.makedirs(target, exist_ok=True)
-        link = f'{target}/mav0'
-        if not os.path.exists(link):
-            os.symlink(f'{kaggle_map[seq_name]}/mav0', link)
-        print(f'[LINK] {seq_name} -> {kaggle_map[seq_name]}')
-        continue
-
-    url = f'{EUROC_BASE}/{subfolder}/{seq_name}/{seq_name}.zip'
-    zip_path = f'/tmp/{seq_name}.zip'
-    print(f'[DOWNLOAD] {seq_name} ... ', end='', flush=True)
-    subprocess.run(['wget', '-q', '-O', zip_path, url], check=True)
-    os.makedirs(target, exist_ok=True)
-    subprocess.run(['unzip', '-q', '-o', zip_path, '-d', target], check=True)
-    os.remove(zip_path)
-    print('done')
-
-# Summary
-total = 0
-for seq_name, _, _ in SEQUENCES:
-    size = shutil.disk_usage(f'{DEST}/{seq_name}').used if os.path.isdir(f'{DEST}/{seq_name}') else 0
-    du = subprocess.run(['du', '-sh', f'{DEST}/{seq_name}'], capture_output=True, text=True).stdout.split()[0]
-    print(f'  {seq_name}: {du}')
-""")
-
-# ---------------------------------------------------------------- Cell 10
-md("""---
-## 8. Prepare ground truth + frame counts
-
-- Converts each sequence's EuRoC GT CSV → TUM format (`gt.tum`) so the SLAM
-  outputs (also TUM) can be compared with `evo_ape tum` directly.
-- Counts input frames in `cam0/data/` per sequence — needed later for the
-  **tracking success rate** metric (rows_in_trajectory / input_frames).
-""")
-
-code(r"""import os, glob
-import pandas as pd
-
-EUROC = '/content/euroc'
-frame_counts = {}
-
-for seq_name, _, _ in SEQUENCES:
-    base = f'{EUROC}/{seq_name}/mav0'
-    if not os.path.isdir(base):
-        print(f'[SKIP] {seq_name} — not downloaded')
-        continue
-
-    # ---- Convert GT CSV to TUM ----
-    gt_csv = f'{base}/state_groundtruth_estimate0/data.csv'
-    gt_tum = f'{EUROC}/{seq_name}/gt.tum'
-    if os.path.isfile(gt_csv) and not os.path.isfile(gt_tum):
-        # EuRoC CSV columns: ts, px, py, pz, qw, qx, qy, qz, vx, vy, vz, wx, wy, wz, ax, ay, az
-        # comment='#' drops the header line; header=None prevents pandas from promoting a data row.
-        df = pd.read_csv(gt_csv, comment='#', header=None)
-        ts_s = df.iloc[:, 0].astype('int64') / 1e9
-        # TUM columns: ts x y z qx qy qz qw  (quaternion order differs from EuRoC!)
-        out = pd.DataFrame({
-            'ts': ts_s,
-            'x':  df.iloc[:, 1],
-            'y':  df.iloc[:, 2],
-            'z':  df.iloc[:, 3],
-            'qx': df.iloc[:, 5],
-            'qy': df.iloc[:, 6],
-            'qz': df.iloc[:, 7],
-            'qw': df.iloc[:, 4],
-        })
-        out.to_csv(gt_tum, sep=' ', header=False, index=False,
-                   float_format='%.9f')
-        print(f'[GT]    {seq_name}: wrote {gt_tum} ({len(out)} rows)')
-    elif os.path.isfile(gt_tum):
-        print(f'[GT]    {seq_name}: already converted')
-
-    # ---- Count input frames ----
-    imgs = glob.glob(f'{base}/cam0/data/*.png')
-    frame_counts[seq_name] = len(imgs)
-    print(f'[FRAMES] {seq_name}: {len(imgs)} cam0 images')
-
-# Stash for later cells
-import json
-with open('/content/results/frame_counts.json', 'w') as f:
-    json.dump(frame_counts, f, indent=2)
-""")
-
-# ---------------------------------------------------------------- Cell 11
-md("""---
-## 9. Helpers: trajectory I/O, evaluation, failure classification
-
-All downstream cells use these utilities so each system's run loop stays short.
-""")
-
-code(r"""import os, json, subprocess, time, shutil, glob, zipfile
-from pathlib import Path
-
-EVO_ZIP_STATS_KEY = 'stats'   # evo --save_results writes stats.json inside the zip
-
-def count_traj_rows(path):
-    '''Count non-comment rows in a TUM trajectory file.'''
-    if not os.path.isfile(path) or os.path.getsize(path) == 0:
-        return 0
-    n = 0
-    with open(path) as f:
-        for line in f:
-            s = line.strip()
-            if s and not s.startswith('#'):
-                n += 1
-    return n
-
+code(r"""import subprocess, json, zipfile
 
 def run_evo(metric, gt_tum, est_tum, out_zip, sim3=True):
-    '''Run evo_ape or evo_rpe in TUM mode and return RMSE (float or None).'''
-    assert metric in ('ape', 'rpe')
     binary = f'evo_{metric}'
-    cmd = [binary, 'tum', gt_tum, est_tum, '--align']
-    if sim3:
+    cmd = [binary, 'tum', str(gt_tum), str(est_tum), '--align']
+    if sim3 and metric == 'ape':
         cmd.append('--correct_scale')
-    cmd += ['--save_results', out_zip, '--no_warnings']
+    cmd += ['--save_results', str(out_zip), '--no_warnings']
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired:
         return None
-    if not os.path.isfile(out_zip):
+    if not out_zip.exists():
         return None
-    # Pull rmse out of the stats.json bundled in the zip
     try:
         with zipfile.ZipFile(out_zip) as zf:
             with zf.open('stats.json') as sf:
@@ -902,680 +651,179 @@ def run_evo(metric, gt_tum, est_tum, out_zip, sim3=True):
         return None
 
 
-def classify_failure(ate, rpe, success_rate, per_frame_ms):
-    '''Rule-based failure taxonomy (matches midterm report IV.D).
+def classify(ate, rpe, tracking_rate, per_frame_ms):
+    '''Data-driven failure taxonomy, adapted from the interim report.
 
-    Returns one of:
-        success, minor_drift, tracking_divergence, tracking_loss,
-        feature_starvation, performance_bottleneck, complete_failure
-    Rules are applied in order; first match wins.
+    Applied in order, first match wins. Categories without a loop closure
+    module ("false_loop_closure", "map_corruption") are dropped since
+    this VO has neither.
     '''
-    if ate is None or success_rate is None or success_rate == 0:
+    if ate is None or tracking_rate == 0:
         return 'complete_failure'
-    if success_rate < 0.30:
+    if tracking_rate < 0.30:
         return 'feature_starvation'
-    if success_rate < 0.85:
+    if tracking_rate < 0.80:
         return 'tracking_loss'
-    if per_frame_ms is not None and per_frame_ms > REALTIME_BUDGET_MS:
+    if per_frame_ms is not None and per_frame_ms > REALTIME_MS:
         return 'performance_bottleneck'
-    if ate > 1.0:
+    if ate > 2.0:
         return 'tracking_divergence'
-    if ate > 0.3:
+    if ate > 0.5:
         return 'minor_drift'
     return 'success'
 
 
-def checkpoint_dir(src_dir, dst_dir, prefix=None):
-    '''Copy files from src_dir to dst_dir (Drive). Optionally filter by prefix.'''
-    os.makedirs(dst_dir, exist_ok=True)
-    for f in os.listdir(src_dir):
-        if prefix and not f.startswith(prefix):
-            continue
-        shutil.copy2(f'{src_dir}/{f}', f'{dst_dir}/{f}')
+sweep_log = json.loads((EVAL_DIR / 'sweep_log.json').read_text())
+results = []
+for entry in sweep_log:
+    seq     = entry['seq']
+    det     = entry['detector']
+    deg     = entry['degradation']
+    traj    = Path(entry['traj_path'])
+    gt_tum  = SEQ_META[seq]['gt_path']
 
+    ate_zip = EVAL_DIR / f'{seq}__{det}__{deg}__ape.zip'
+    rpe_zip = EVAL_DIR / f'{seq}__{det}__{deg}__rpe.zip'
+    ate = run_evo('ape', gt_tum, traj, ate_zip, sim3=True)
+    rpe = run_evo('rpe', gt_tum, traj, rpe_zip, sim3=False)
 
-print('Helpers loaded.')
+    tracking_rate = entry.get('tracking_rate')
+    if tracking_rate is None:
+        # Row was skipped (already-computed file). Re-derive from N frames.
+        frames = SEQ_META[seq]['frames'][::FRAME_STRIDE]
+        tracking_rate = (entry['n_rows'] - 1) / max(len(frames) - 1, 1)
+
+    per_frame_ms = entry.get('per_frame_ms')
+    label = classify(ate, rpe, tracking_rate, per_frame_ms)
+
+    results.append({
+        'seq': seq, 'detector': det, 'degradation': deg,
+        'ate_rmse': ate, 'rpe_rmse': rpe,
+        'tracking_rate': tracking_rate,
+        'per_frame_ms': per_frame_ms,
+        'failure_mode': label,
+        'traj_rows': entry['n_rows'],
+    })
+
+    print(f'{seq:14s} {det:4s} {deg:14s}  '
+          f'ATE={ate if ate is None else f"{ate:6.3f}":>7s}  '
+          f'RPE={rpe if rpe is None else f"{rpe:6.3f}":>7s}  '
+          f'track={tracking_rate:5.1%}  '
+          f'-> {label}')
+
+(EVAL_DIR / 'all_results.json').write_text(json.dumps(results, indent=2))
+print(f'\nWrote {EVAL_DIR / "all_results.json"}')
 """)
 
-# ---------------------------------------------------------------- Cell 12
+# ---------------------------------------------------------------- Cell 9
 md("""---
-## 10. Run ORB-SLAM3
+## 9. Results: tables and plots
 
-Monocular ORB-SLAM3 on each sequence, `NUM_RUNS` times. Launched under
-`xvfb-run` so the compiled-in Pangolin viewer has a virtual display to attach
-to but never renders anything visible.
+- Pivot table of ATE RMSE per `(detector × degradation)` per sequence.
+- Bar plots of ATE vs degradation level.
+- Failure-mode heatmap.
 """)
 
-code(r"""import subprocess, os, time, shutil, json
-
-ORB = '/content/ORB_SLAM3'
-VOCAB    = f'{ORB}/Vocabulary/ORBvoc.txt'
-CONFIG   = f'{ORB}/Examples/Monocular/EuRoC.yaml'
-BINARY   = f'{ORB}/Examples/Monocular/mono_euroc'
-TS_DIR   = f'{ORB}/Examples/Monocular/EuRoC_TimeStamps'
-
-TIMESTAMP_MAP = {
-    'MH_01_easy':       'MH01.txt',
-    'V1_01_easy':       'V101.txt',
-    'MH_03_medium':     'MH03.txt',
-    'V1_02_medium':     'V102.txt',
-    'MH_05_difficult':  'MH05.txt',
-    'V1_03_difficult':  'V103.txt',
-}
-
-RESULTS = '/content/results/orbslam3'
-DRIVE   = '/content/drive/MyDrive/slam_results/orbslam3'
-
-if not os.path.isfile(BINARY):
-    print('ERROR: mono_euroc binary missing — did the ORB-SLAM3 build succeed?')
-else:
-    run_log = {}
-
-    for seq, _, _ in SEQUENCES:
-        seq_dir = f'/content/euroc/{seq}'
-        if not os.path.isdir(f'{seq_dir}/mav0'):
-            print(f'[SKIP] {seq}')
-            continue
-
-        ts_file = f'{TS_DIR}/{TIMESTAMP_MAP[seq]}'
-        run_log[seq] = []
-        print(f'\n{"="*60}\nORB-SLAM3 on {seq} ({NUM_RUNS} runs)')
-
-        for i in range(NUM_RUNS):
-            out = f'{RESULTS}/{seq}_run{i}.txt'
-            # Purge stale outputs from a prior run so we never copy them forward on failure
-            for stale in (f'{ORB}/CameraTrajectory.txt', f'{ORB}/KeyFrameTrajectory.txt'):
-                if os.path.isfile(stale):
-                    os.remove(stale)
-            print(f'  run {i+1}/{NUM_RUNS} ...', end=' ', flush=True)
-            t0 = time.time()
-            try:
-                # mono_euroc expects the sequence PARENT of mav0 (it appends /mav0/cam0/data internally)
-                cmd = ['xvfb-run', '-a', '-s', '-screen 0 640x480x24',
-                       BINARY, VOCAB, CONFIG, seq_dir, ts_file]
-                r = subprocess.run(cmd, capture_output=True, text=True,
-                                   timeout=900, cwd=ORB)
-                elapsed = time.time() - t0
-
-                traj_found = False
-                for cand in (f'{ORB}/CameraTrajectory.txt', f'{ORB}/KeyFrameTrajectory.txt'):
-                    if os.path.isfile(cand) and os.path.getsize(cand) > 0:
-                        shutil.copy2(cand, out)
-                        traj_found = True
-                        break
-                success = traj_found and r.returncode == 0
-                n_rows = count_traj_rows(out) if success else 0
-                print(f'{"OK" if success else "FAIL"}  t={elapsed:.1f}s  rows={n_rows}')
-                if not success:
-                    for line in r.stderr.strip().splitlines()[-3:]:
-                        print(f'    {line}')
-
-                run_log[seq].append({
-                    'run': i,
-                    'time_s': round(elapsed, 2),
-                    'output': out if success else None,
-                    'success': success,
-                    'traj_rows': n_rows,
-                })
-            except subprocess.TimeoutExpired:
-                elapsed = time.time() - t0
-                print(f'TIMEOUT  t={elapsed:.1f}s')
-                run_log[seq].append({'run': i, 'time_s': round(elapsed, 2),
-                                     'output': None, 'success': False, 'traj_rows': 0})
-
-        checkpoint_dir(RESULTS, DRIVE, prefix=seq)
-
-    with open(f'{RESULTS}/run_log.json', 'w') as f:
-        json.dump(run_log, f, indent=2)
-    shutil.copy2(f'{RESULTS}/run_log.json', f'{DRIVE}/run_log.json')
-    print('\n=== ORB-SLAM3 runs complete ===')
-""")
-
-# ---------------------------------------------------------------- Cell 13
-md("""---
-## 11. Run Stella-VSLAM
-""")
-
-code(r"""import subprocess, os, time, shutil, json, glob
-
-STELLA   = '/content/stella_vslam'
-EXAMPLES = '/content/stella_vslam_examples'
-VOCAB    = f'{STELLA}/vocab/orb_vocab.fbow'
-RESULTS  = '/content/results/stella'
-DRIVE    = '/content/drive/MyDrive/slam_results/stella'
-
-# Find the run_euroc binary. Upstream split examples (run_euroc_slam etc.)
-# into stella_vslam_examples; check there first, fall back to legacy path.
-STELLA_BIN = (
-    next(iter(sorted(glob.glob(f'{EXAMPLES}/build/**/run_euroc*', recursive=True))), None)
-    or next(iter(sorted(glob.glob(f'{STELLA}/build/**/run_euroc*', recursive=True))), None)
-)
-
-# Locate a monocular EuRoC config YAML shipped with Stella
-STELLA_CONFIG = None
-for pat in ('example/**/euroc_mono.yaml', 'example/**/EuRoC_mono.yaml',
-            '**/euroc*mono*.yaml', 'example/**/euroc.yaml'):
-    hit = sorted(glob.glob(f'{STELLA}/{pat}', recursive=True))
-    if hit:
-        STELLA_CONFIG = hit[0]
-        break
-
-print(f'Stella binary: {STELLA_BIN}')
-print(f'Stella config: {STELLA_CONFIG}')
-print(f'Stella vocab : {VOCAB}')
-
-if not STELLA_BIN or not STELLA_CONFIG or not os.path.isfile(VOCAB):
-    print('\nSkipping Stella runs (binary, config, or vocab missing).')
-else:
-    run_log = {}
-    for seq, _, _ in SEQUENCES:
-        seq_dir = f'/content/euroc/{seq}'
-        data_path = f'{seq_dir}/mav0' if os.path.isdir(f'{seq_dir}/mav0') else seq_dir
-        if not os.path.isdir(data_path):
-            print(f'[SKIP] {seq}')
-            continue
-
-        run_log[seq] = []
-        print(f'\n{"="*60}\nStella-VSLAM on {seq} ({NUM_RUNS} runs)')
-
-        for i in range(NUM_RUNS):
-            out = f'{RESULTS}/{seq}_run{i}.txt'
-            # Stella writes frame_trajectory.txt under --eval-log-dir. Purge stale copies.
-            stella_traj = '/tmp/frame_trajectory.txt'
-            for stale in (stella_traj, '/tmp/keyframe_trajectory.txt'):
-                if os.path.isfile(stale):
-                    os.remove(stale)
-            print(f'  run {i+1}/{NUM_RUNS} ...', end=' ', flush=True)
-
-            cmd = ['xvfb-run', '-a', '-s', '-screen 0 640x480x24',
-                   STELLA_BIN,
-                   '-v', VOCAB,
-                   '-d', data_path,
-                   '-c', STELLA_CONFIG,
-                   '--auto-term',
-                   '--no-sleep',
-                   '--eval-log-dir', '/tmp',
-                   '--map-db-out',  f'/tmp/stella_{seq}_{i}.msg']
-
-            t0 = time.time()
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-                elapsed = time.time() - t0
-
-                if os.path.isfile(stella_traj) and os.path.getsize(stella_traj) > 0:
-                    shutil.copy2(stella_traj, out)
-                    success = True
-                else:
-                    success = False
-                n_rows = count_traj_rows(out) if success else 0
-                print(f'{"OK" if success else "FAIL"}  t={elapsed:.1f}s  rows={n_rows}')
-                if not success:
-                    for line in r.stderr.strip().splitlines()[-3:]:
-                        print(f'    {line}')
-
-                run_log[seq].append({
-                    'run': i,
-                    'time_s': round(elapsed, 2),
-                    'output': out if success else None,
-                    'success': success,
-                    'traj_rows': n_rows,
-                })
-            except subprocess.TimeoutExpired:
-                elapsed = time.time() - t0
-                print(f'TIMEOUT  t={elapsed:.1f}s')
-                run_log[seq].append({'run': i, 'time_s': round(elapsed, 2),
-                                     'output': None, 'success': False, 'traj_rows': 0})
-
-        checkpoint_dir(RESULTS, DRIVE, prefix=seq)
-
-    with open(f'{RESULTS}/run_log.json', 'w') as f:
-        json.dump(run_log, f, indent=2)
-    shutil.copy2(f'{RESULTS}/run_log.json', f'{DRIVE}/run_log.json')
-    print('\n=== Stella-VSLAM runs complete ===')
-""")
-
-# ---------------------------------------------------------------- Cell 14
-md("""---
-## 12. Run DSO (best-effort)
-
-DSO reads an image folder plus a text-format `camera.txt` (intrinsics +
-distortion). We synthesise one per sequence from EuRoC's `sensor.yaml`, then
-run DSO with `mode=1` (online photometric optimization — no `pcalib.txt`/
-`vignette.png` required). If the DSO binary is absent, we skip and log the
-state; downstream cells treat DSO results as missing.
-""")
-
-code(r"""import os, yaml, subprocess, time, shutil, json, glob
-
-DSO_BIN = '/content/dso/build/bin/dso_dataset'
-RESULTS = '/content/results/dso'
-DRIVE   = '/content/drive/MyDrive/slam_results/dso'
-
-dso_state = '/content/dso_status/state'
-dso_ok = os.path.isfile(DSO_BIN) and os.path.isfile(dso_state) and open(dso_state).read().strip() == 'ok'
-
-if not dso_ok:
-    print('DSO binary not available — skipping all DSO runs (graceful fallback).')
-    # Write an empty run log so the eval/classify cells still see DSO as a known system
-    with open(f'{RESULTS}/run_log.json', 'w') as f:
-        json.dump({'__status__': 'build_failed'}, f, indent=2)
-else:
-    # ---- Build per-sequence camera.txt + times.txt from sensor.yaml ----
-    def write_dso_calib(seq):
-        sensor = f'/content/euroc/{seq}/mav0/cam0/sensor.yaml'
-        if not os.path.isfile(sensor):
-            return None, None
-        with open(sensor) as f:
-            cfg = yaml.safe_load(f)
-
-        # Intrinsics: [fx, fy, cx, cy]
-        fx, fy, cx, cy = cfg['intrinsics']
-        # Distortion: EuRoC uses radial-tangential (k1, k2, r1, r2)
-        k1, k2, p1, p2 = cfg['distortion_coefficients']
-        W, H = cfg['resolution']
-
-        out_dir = f'/content/dso_input/{seq}'
-        os.makedirs(out_dir, exist_ok=True)
-        cam_txt = f'{out_dir}/camera.txt'
-        # DSO "RadTan" calibration format (4 intrinsics + 4 distortion, normalized to image size)
-        with open(cam_txt, 'w') as f:
-            f.write(f'RadTan {fx/W} {fy/H} {cx/W} {cy/H} {k1} {k2} {p1} {p2}\n')
-            f.write(f'{W} {H}\n')
-            f.write('crop\n')
-            f.write(f'{W} {H}\n')
-
-        # DSO needs a symlinked images/ folder + times.txt listing "id timestamp exposure"
-        img_src = f'/content/euroc/{seq}/mav0/cam0/data'
-        img_link = f'{out_dir}/images'
-        if not os.path.exists(img_link):
-            os.symlink(img_src, img_link)
-
-        # Build times.txt from the image filenames (EuRoC filenames are timestamp-in-ns)
-        times_txt = f'{out_dir}/times.txt'
-        if not os.path.isfile(times_txt):
-            pngs = sorted(glob.glob(f'{img_src}/*.png'))
-            with open(times_txt, 'w') as f:
-                for p in pngs:
-                    stem = os.path.splitext(os.path.basename(p))[0]
-                    ts_s = int(stem) / 1e9
-                    # exposure unknown -> 0 (DSO will run with mode=1)
-                    f.write(f'{stem} {ts_s:.9f} 0\n')
-        return out_dir, cam_txt
-
-    run_log = {}
-    for seq, _, _ in SEQUENCES:
-        in_dir, cam_txt = write_dso_calib(seq)
-        if in_dir is None:
-            print(f'[SKIP] {seq} — no sensor.yaml')
-            continue
-
-        run_log[seq] = []
-        print(f'\n{"="*60}\nDSO on {seq} ({NUM_RUNS} runs)')
-
-        for i in range(NUM_RUNS):
-            out = f'{RESULTS}/{seq}_run{i}.txt'
-            # DSO writes result.txt in cwd; run each attempt in a clean folder
-            cwd = f'/tmp/dso_cwd_{seq}_{i}'
-            os.makedirs(cwd, exist_ok=True)
-            for stale in glob.glob(f'{cwd}/*'):
-                os.remove(stale)
-
-            cmd = ['xvfb-run', '-a', '-s', '-screen 0 640x480x24',
-                   DSO_BIN,
-                   f'files={in_dir}/images',
-                   f'calib={cam_txt}',
-                   'preset=0',
-                   'mode=1',         # online photometric optimization
-                   'nogui=1',
-                   'quiet=1']
-
-            print(f'  run {i+1}/{NUM_RUNS} ...', end=' ', flush=True)
-            t0 = time.time()
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=1200, cwd=cwd)
-                elapsed = time.time() - t0
-                traj = f'{cwd}/result.txt'
-                if os.path.isfile(traj) and os.path.getsize(traj) > 0:
-                    shutil.copy2(traj, out)
-                    success = True
-                else:
-                    success = False
-                n_rows = count_traj_rows(out) if success else 0
-                print(f'{"OK" if success else "FAIL"}  t={elapsed:.1f}s  rows={n_rows}')
-                if not success:
-                    for line in (r.stderr or r.stdout).strip().splitlines()[-3:]:
-                        print(f'    {line}')
-
-                run_log[seq].append({
-                    'run': i,
-                    'time_s': round(elapsed, 2),
-                    'output': out if success else None,
-                    'success': success,
-                    'traj_rows': n_rows,
-                })
-            except subprocess.TimeoutExpired:
-                elapsed = time.time() - t0
-                print(f'TIMEOUT  t={elapsed:.1f}s')
-                run_log[seq].append({'run': i, 'time_s': round(elapsed, 2),
-                                     'output': None, 'success': False, 'traj_rows': 0})
-
-        checkpoint_dir(RESULTS, DRIVE, prefix=seq)
-
-    with open(f'{RESULTS}/run_log.json', 'w') as f:
-        json.dump(run_log, f, indent=2)
-    shutil.copy2(f'{RESULTS}/run_log.json', f'{DRIVE}/run_log.json')
-    print('\n=== DSO runs complete ===')
-""")
-
-# ---------------------------------------------------------------- Cell 15
-md("""---
-## 13. Evaluate all trajectories with `evo`
-
-For every (system × sequence × run) triple we compute:
-
-- **ATE RMSE** via `evo_ape tum --align --correct_scale` (Sim(3) alignment).
-- **RPE RMSE** via `evo_rpe tum --align --correct_scale`.
-- **Tracking success rate** = `rows_in_trajectory / cam0_frames`.
-- **Per-frame processing time** = `wall_time / cam0_frames`.
-
-We then select the **median run** (by ATE RMSE) for each sequence.
-""")
-
-code(r"""import os, json, glob, shutil, zipfile
-import numpy as np
-
-EUROC = '/content/euroc'
-EVAL_DIR  = '/content/results/eval'
-DRIVE_EV  = '/content/drive/MyDrive/slam_results/eval'
-
-with open('/content/results/frame_counts.json') as f:
-    FRAME_COUNTS = json.load(f)
-
-SYSTEMS = {
-    'orbslam3': '/content/results/orbslam3',
-    'stella':   '/content/results/stella',
-    'dso':      '/content/results/dso',
-}
-
-def load_run_log(sys_dir):
-    p = f'{sys_dir}/run_log.json'
-    if os.path.isfile(p):
-        try:
-            return json.load(open(p))
-        except Exception:
-            return {}
-    return {}
-
-all_results = {}   # system -> seq -> {metrics..., all_runs: [...]}
-
-for sys_name, sys_dir in SYSTEMS.items():
-    log = load_run_log(sys_dir)
-    all_results[sys_name] = {}
-    print(f'\n{"="*60}\nEvaluating: {sys_name}')
-
-    if log.get('__status__') == 'build_failed':
-        print(f'  (skipped — {sys_name} build failed)')
-        continue
-
-    for seq, _, _ in SEQUENCES:
-        gt_tum = f'{EUROC}/{seq}/gt.tum'
-        if not os.path.isfile(gt_tum):
-            print(f'  [SKIP] {seq} — no ground truth')
-            continue
-
-        run_files = sorted(glob.glob(f'{sys_dir}/{seq}_run*.txt'))
-        if not run_files:
-            print(f'  [SKIP] {seq} — no trajectory files')
-            continue
-
-        input_frames = FRAME_COUNTS.get(seq, 0)
-        seq_runs = log.get(seq, [])
-
-        per_run = []   # list of dicts with metrics
-        for rf in run_files:
-            # Look up matching run record (for wall-time -> per-frame timing)
-            run_idx = int(os.path.splitext(os.path.basename(rf))[0].split('_run')[-1])
-            run_meta = next((r for r in seq_runs if r.get('run') == run_idx), {})
-
-            ate = run_evo('ape', gt_tum, rf, f'/tmp/evo_{sys_name}_{seq}_r{run_idx}_ape.zip')
-            rpe = run_evo('rpe', gt_tum, rf, f'/tmp/evo_{sys_name}_{seq}_r{run_idx}_rpe.zip')
-            n_rows = count_traj_rows(rf)
-            success_rate = (n_rows / input_frames) if input_frames else None
-            wall_s = run_meta.get('time_s')
-            per_frame_ms = (wall_s * 1000.0 / input_frames) if (wall_s and input_frames) else None
-
-            per_run.append({
-                'run_idx': run_idx,
-                'ate_rmse': ate,
-                'rpe_rmse': rpe,
-                'success_rate': success_rate,
-                'per_frame_ms': per_frame_ms,
-                'traj_rows': n_rows,
-                'wall_s': wall_s,
-                'file': rf,
-            })
-
-        # Drop runs with no ATE (completely failed evo)
-        usable = [r for r in per_run if r['ate_rmse'] is not None]
-        if not usable:
-            # Still record the failure
-            all_results[sys_name][seq] = {
-                'ate_rmse': None, 'rpe_rmse': None,
-                'success_rate': 0.0, 'per_frame_ms': None,
-                'num_runs_total': len(per_run), 'num_runs_usable': 0,
-                'all_runs': per_run,
-            }
-            print(f'  {seq}: all runs failed evaluation')
-            continue
-
-        # Median by ATE
-        usable.sort(key=lambda r: r['ate_rmse'])
-        med = usable[len(usable) // 2]
-        # Persist the median run's evo zips with stable names
-        shutil.copy2(f"/tmp/evo_{sys_name}_{seq}_r{med['run_idx']}_ape.zip",
-                     f'{EVAL_DIR}/{sys_name}_{seq}_ate.zip')
-        shutil.copy2(f"/tmp/evo_{sys_name}_{seq}_r{med['run_idx']}_rpe.zip",
-                     f'{EVAL_DIR}/{sys_name}_{seq}_rpe.zip')
-
-        all_results[sys_name][seq] = {
-            'ate_rmse':     med['ate_rmse'],
-            'rpe_rmse':     med['rpe_rmse'],
-            'success_rate': med['success_rate'],
-            'per_frame_ms': med['per_frame_ms'],
-            'num_runs_total': len(per_run),
-            'num_runs_usable': len(usable),
-            'median_run_idx': med['run_idx'],
-            'all_runs':      per_run,
-        }
-        print(f"  {seq}: ATE={med['ate_rmse']:.4f}  RPE={med['rpe_rmse']:.4f}  "
-              f"success={med['success_rate']:.2%}  per_frame={med['per_frame_ms']:.1f}ms  "
-              f"({len(usable)}/{len(per_run)} usable)")
-
-out_path = f'{EVAL_DIR}/all_results.json'
-with open(out_path, 'w') as f:
-    json.dump(all_results, f, indent=2)
-shutil.copy2(out_path, f'{DRIVE_EV}/all_results.json')
-print(f'\n=== Wrote {out_path} ===')
-""")
-
-# ---------------------------------------------------------------- Cell 16
-md("""---
-## 14. Auto-classify failure modes
-
-Applies the rule-based classifier from §IV.D of the midterm report to the
-median run of each (system, sequence) pair.
-""")
-
-code(r"""import json, shutil
-
-with open('/content/results/eval/all_results.json') as f:
-    results = json.load(f)
-
-taxonomy = {}
-for sys_name, seq_map in results.items():
-    taxonomy[sys_name] = {}
-    for seq, m in seq_map.items():
-        label = classify_failure(m.get('ate_rmse'), m.get('rpe_rmse'),
-                                 m.get('success_rate'), m.get('per_frame_ms'))
-        taxonomy[sys_name][seq] = label
-
-out = '/content/results/eval/failure_taxonomy.json'
-with open(out, 'w') as f:
-    json.dump(taxonomy, f, indent=2)
-shutil.copy2(out, '/content/drive/MyDrive/slam_results/eval/failure_taxonomy.json')
-
-# Pretty print
-print(f'\n{"Sequence":<20} ' + '  '.join(f'{s:>22}' for s in results))
-for seq, _, _ in SEQUENCES:
-    row = [f'{seq:<20}']
-    for sys_name in results:
-        label = taxonomy.get(sys_name, {}).get(seq, '—')
-        row.append(f'{label:>22}')
-    print('  '.join(row))
-
-print('\nRule summary (applied in order, first match wins):')
-print('  success_rate = 0 or ATE = None   -> complete_failure')
-print('  success_rate < 0.30              -> feature_starvation')
-print('  success_rate < 0.85              -> tracking_loss')
-print(f'  per_frame_ms > {REALTIME_BUDGET_MS:.0f}ms         -> performance_bottleneck')
-print('  ATE > 1.0 m                       -> tracking_divergence')
-print('  ATE > 0.3 m                       -> minor_drift')
-print('  else                              -> success')
-""")
-
-# ---------------------------------------------------------------- Cell 17
-md("""---
-## 15. Results summary: table + plots
-""")
-
-code(r"""import json, shutil
+code(r"""import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
-with open('/content/results/eval/all_results.json') as f:
-    results = json.load(f)
-with open('/content/results/eval/failure_taxonomy.json') as f:
-    taxonomy = json.load(f)
+results = json.loads((EVAL_DIR / 'all_results.json').read_text())
+df = pd.DataFrame(results)
 
-systems = list(results.keys())
-seq_names = [s[0] for s in SEQUENCES]
+# --- Pivot: ATE per (seq, detector, degradation) ---
+for seq in df['seq'].unique():
+    sub = df[df['seq'] == seq]
+    pt = sub.pivot(index='degradation', columns='detector', values='ate_rmse')
+    pt = pt.reindex([d[0] for d in DEGRADATIONS])
+    print(f'\nATE RMSE (m) — {seq}')
+    print(pt.to_string(float_format=lambda v: f'{v:6.3f}' if pd.notnull(v) else '   —  '))
 
-def fmt(v, prec=4):
-    return f'{v:.{prec}f}' if isinstance(v, (int, float)) else '—'
+# --- Failure-mode table ---
+print('\nFailure mode per (seq, detector, degradation):')
+fm = df.pivot_table(index=['seq', 'degradation'], columns='detector',
+                    values='failure_mode', aggfunc='first')
+fm = fm.reindex([(s, d[0]) for s in df['seq'].unique() for d in DEGRADATIONS])
+print(fm.to_string())
 
-# ---- Print table ----
-print(f'{"Sequence":<20} ' + ''.join(f'{s:>14} ATE{s:>10} RPE{s:>6} SR{s:>8} ms/f ' for s in systems))
-print('-' * (20 + 42 * len(systems)))
-for seq in seq_names:
-    row = [f'{seq:<20}']
-    for sys_name in systems:
-        m = results.get(sys_name, {}).get(seq, {})
-        ate = fmt(m.get('ate_rmse'))
-        rpe = fmt(m.get('rpe_rmse'))
-        sr  = f"{m['success_rate']:.2f}" if m.get('success_rate') is not None else '—'
-        pt  = fmt(m.get('per_frame_ms'), prec=1)
-        row.append(f'{ate:>14} {rpe:>14} {sr:>9} {pt:>8}')
-    print('  '.join(row))
+# --- Plots ---
+deg_labels = [d[0] for d in DEGRADATIONS]
+fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+colors = {'ORB': '#2196F3', 'SIFT': '#FF9800'}
 
-print('\nFailure taxonomy:')
-for seq in seq_names:
-    row = [f'  {seq:<20}']
-    for sys_name in systems:
-        row.append(f'{sys_name}={taxonomy.get(sys_name, {}).get(seq, "—"):<22}')
-    print('  '.join(row))
-
-# ---- Plots ----
-fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-colors = {'orbslam3': '#2196F3', 'stella': '#FF9800', 'dso': '#4CAF50'}
-
-for ax, metric, label in [
-    (axes[0, 0], 'ate_rmse',     'ATE RMSE (m)'),
-    (axes[0, 1], 'rpe_rmse',     'RPE RMSE (m)'),
-    (axes[1, 0], 'success_rate', 'Tracking success rate'),
-    (axes[1, 1], 'per_frame_ms', 'Per-frame time (ms)'),
+for ax, metric, ylabel in [
+    (axes[0, 0], 'ate_rmse',      'ATE RMSE (m)'),
+    (axes[0, 1], 'rpe_rmse',      'RPE RMSE (m)'),
+    (axes[1, 0], 'tracking_rate', 'Tracking success rate'),
+    (axes[1, 1], 'per_frame_ms',  'Per-frame time (ms)'),
 ]:
-    x = np.arange(len(seq_names))
-    width = 0.8 / max(len(systems), 1)
-    for i, sys_name in enumerate(systems):
-        vals = [results.get(sys_name, {}).get(s, {}).get(metric) or 0 for s in seq_names]
+    x = np.arange(len(deg_labels))
+    width = 0.8 / max(len(DETECTORS), 1)
+    for i, det in enumerate(DETECTORS):
+        sub = df[df['detector'] == det].groupby('degradation')[metric].mean()
+        vals = [sub.get(lbl, 0) or 0 for lbl in deg_labels]
         ax.bar(x + i * width - 0.4 + width / 2, vals, width,
-               label=sys_name, color=colors.get(sys_name, None))
-    ax.set_title(label)
+               label=det, color=colors.get(det))
     ax.set_xticks(x)
-    ax.set_xticklabels([s.replace('_', '\n') for s in seq_names], fontsize=8)
+    ax.set_xticklabels(deg_labels, rotation=45, ha='right', fontsize=8)
+    ax.set_ylabel(ylabel)
     ax.legend()
     ax.grid(axis='y', alpha=0.3)
 
-axes[1, 1].axhline(REALTIME_BUDGET_MS, color='red', ls='--', lw=1, alpha=0.6,
-                   label='realtime budget')
-axes[1, 1].legend()
-
+axes[1, 1].axhline(REALTIME_MS, color='red', ls='--', lw=1, alpha=0.6)
 plt.tight_layout()
-fig_path = '/content/results/eval/comparison_plot.png'
-plt.savefig(fig_path, dpi=150)
+fig_path = EVAL_DIR / 'comparison_plot.png'
+plt.savefig(fig_path, dpi=150, bbox_inches='tight')
 plt.show()
-shutil.copy2(fig_path, '/content/drive/MyDrive/slam_results/eval/comparison_plot.png')
-print(f'\nPlot saved to {fig_path}')
+print(f'\nPlot saved -> {fig_path}')
 """)
 
-# ---------------------------------------------------------------- Cell 18
+# ---------------------------------------------------------------- Cell 10
 md("""---
-## 16. Record compute environment
-""")
+## 10. Notes & limitations
 
-code(r"""%%bash
-echo '=== Compute Environment ==='
-echo "CPU    : $(lscpu | grep 'Model name' | sed 's/.*: *//')"
-echo "Cores  : $(nproc)"
-echo "RAM    : $(free -h | awk '/^Mem:/{print $2}')"
-echo "GPU    : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'None')"
-echo "Disk   : $(df -h /content | awk 'NR==2{print $4}') free"
-echo "Ubuntu : $(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY | cut -d= -f2)"
-echo "Date   : $(date -u)"
-""")
+- **Scale recovery is cheated via GT** — each inter-frame translation is
+  scaled by the magnitude of the ground-truth translation over the same
+  interval. This isolates detector/matcher robustness; a proper
+  pipeline would recover scale from triangulated map points.
+- **No loop closure, no bundle adjustment** — this is pure odometry. The
+  interim report's "false_loop_closure" and "map_corruption" categories
+  are therefore dropped from the taxonomy.
+- **Sim(3) ATE** averages out per-step scale drift, so an ATE of zero
+  does not imply perfect scale; it implies correct *shape* up to a
+  single global scale factor.
+- **Synthetic degradations ≠ real degradations.** Gaussian blur is a
+  coarse proxy for motion blur (real motion blur is direction-dependent
+  and exposure-dependent). Gamma darkening ignores sensor-noise increase
+  at low light. Findings should be read as "these detectors respond to
+  these image transformations in these ways" — not as strong claims
+  about deployment-time behaviour.
+- **Rolling shutter, textureless environments** from the proposal are
+  not studied here — would require datasets and VO changes beyond scope.
 
-# ---------------------------------------------------------------- Cell 19
-md("""---
-## Notes & edge cases
+### Running the full sweep
+Flip `QUICK_MODE = False` in cell 2 and re-run from cell 3 onwards
+(downloads the second sequence and runs the 10-level degradation sweep).
+Total runtime ≈ 1 h on a recent laptop.
 
-### Session timeout recovery
-If Colab disconnects mid-run:
-1. Re-run cells 0–1 (mount Drive, set config).
-2. Cells 2–8 are idempotent — they skip if binaries / vocabulary / dataset are present.
-3. Cells 10–12 produce per-run TUM files that are checkpointed to Drive after
-   each sequence, so you never lose results for sequences that already ran.
+### Regenerating this notebook
+Edit `build_notebook.py` and run:
 
-### Known issues & design notes
-- **ORB-SLAM3 on `V1_03_difficult`**: tracking loss is expected; the partial
-  trajectory is still evaluated and will typically fall into the
-  `feature_starvation` or `tracking_loss` bucket in the taxonomy.
-- **DSO graceful fallback**: if `cell 8` fails to produce `dso_dataset`, the
-  DSO run cell writes a `__status__: build_failed` marker and the eval stage
-  treats DSO results as missing instead of crashing the pipeline.
-- **Sim(3) alignment**: monocular SLAM has unobservable scale, so every ATE /
-  RPE call uses `--align --correct_scale`. Without this, ATE values would be
-  meaninglessly large.
-- **DSO without photometric calibration**: we run DSO with `mode=1` (online
-  photometric param estimation). Accuracy would improve with a proper
-  `pcalib.txt`/`vignette.png`, but those files aren't available for EuRoC and
-  generating them is out of scope for this project.
-- **Failure taxonomy heuristics**: purely rule-based on the median-run metrics.
-  Cross-checking a few cases against trajectory plots is recommended before
-  citing a particular label in the final report.
+```bash
+python build_notebook.py
+```
 
-### Switching to the full protocol
-The default `QUICK_MODE = True` runs each sequence once for fast end-to-end
-validation. For the midterm's protocol (median of 3 runs), set
-`QUICK_MODE = False` in cell 2 and re-run cells 10–15.
+That rewrites `VO_Robustness_EuRoC.ipynb` from the cell strings in the
+generator. Keep the generator — editing the notebook JSON directly is
+painful and won't survive the next regeneration.
 """)
 
 # ---------------------------------------------------------------- Emit notebook
 notebook = {
     "cells": cells,
     "metadata": {
-        "colab": {"provenance": []},
         "kernelspec": {"name": "python3", "display_name": "Python 3"},
-        "language_info": {"name": "python"},
+        "language_info": {"name": "python", "version": "3.11"},
     },
     "nbformat": 4,
     "nbformat_minor": 5,
