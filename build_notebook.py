@@ -402,58 +402,188 @@ Pangolin viewer and socket publisher both disabled.
 """)
 
 code(r"""%%bash
-set -e
-cd /content
+# Cell 5: Build Stella-VSLAM (robust, fully verbose inline)
+#
+# Key design points after multiple iterations:
+#   * Source-build g2o: Ubuntu's libg2o-dev does NOT ship g2oConfig.cmake,
+#     which stella's find_package(g2o CONFIG) requires. So we source-build
+#     g2o from RainerKuemmerle/g2o unconditionally (unless already built).
+#   * Upstream stella_vslam split example binaries (run_euroc_slam etc.)
+#     into a separate repo (stella-cv/stella_vslam_examples). We build
+#     stella_vslam itself, install it, then build the examples repo
+#     against the installed library.
+#   * All cmake/make output goes inline to stdout (no > log files). Earlier
+#     revisions redirected to /tmp and used tail-on-failure, but the log
+#     tail occasionally didn't reach the notebook - streaming the build
+#     output directly makes failures unmissable.
+#   * rm -rf build before every cmake so stale CMakeCache doesn't poison
+#     a retry.
+#   * -Wno-error when building 3rd/FBoW (FBoW's -Werror trips on gcc 11+
+#     deprecation warnings).
+#   * On any failure: write /content/stella_status/state=failed and exit 0,
+#     so the pipeline continues and cell 11 skips Stella gracefully.
+exec 2>&1
+set +e
 
-# Skip if an EuRoC runner binary already exists anywhere in the build tree
-if find /content/stella_vslam/build -name 'run_euroc*' -type f 2>/dev/null | grep -q .; then
+STATE_DIR=/content/stella_status
+mkdir -p "$STATE_DIR"
+STATE_FILE="$STATE_DIR/state"
+
+fail() {
+    echo ""
+    echo "=== STELLA BUILD FAILED: $1 ==="
+    echo "failed: $1" > "$STATE_FILE"
+    echo "(cell 11 will detect the missing binary and skip Stella runs)"
+    exit 0
+}
+
+STELLA=/content/stella_vslam
+EXAMPLES=/content/stella_vslam_examples
+
+if find "$EXAMPLES/build" "$STELLA/build" -name 'run_euroc*' -type f -executable 2>/dev/null | grep -q .; then
     echo 'Stella-VSLAM already built, skipping.'
+    echo 'ok' > "$STATE_FILE"
     exit 0
 fi
 
-if [ ! -d /content/stella_vslam ]; then
-    git clone --recursive --depth 1 https://github.com/stella-cv/stella_vslam.git /content/stella_vslam
-fi
-cd /content/stella_vslam
-git submodule update --init --recursive 2>/dev/null || true
+echo '=============================================================='
+echo '>>> [1/7] Installing g2o from source'
+echo '=============================================================='
+echo '    (Ubuntu libg2o-dev does not ship g2oConfig.cmake, which'
+echo '     stella_vslam requires via find_package(g2o CONFIG).)'
 
-# Stella bundles FBoW + g2o under 3rd/. Build and install each.
-for sub in 3rd/FBoW 3rd/fbow 3rd/g2o; do
-    if [ -d "$sub" ]; then
-        echo "=== Building $sub ==="
-        pushd "$sub" > /dev/null
-        mkdir -p build && cd build
-        cmake .. -DCMAKE_BUILD_TYPE=Release > /tmp/${sub//\//_}_cmake.log 2>&1
-        make -j$(nproc) > /tmp/${sub//\//_}_build.log 2>&1
-        make install > /dev/null 2>&1 || sudo make install > /dev/null 2>&1
-        popd > /dev/null
+if [ -f /usr/local/lib/cmake/g2o/g2oConfig.cmake ]; then
+    echo '  g2oConfig.cmake already installed at /usr/local/lib/cmake/g2o/, skipping.'
+else
+    if [ ! -d /content/g2o ]; then
+        echo '  Cloning g2o...'
+        git clone --depth 1 https://github.com/RainerKuemmerle/g2o.git /content/g2o \
+            || fail 'g2o git clone failed'
+    fi
+    rm -rf /content/g2o/build
+    mkdir -p /content/g2o/build
+    cd /content/g2o/build
+    echo '  Running g2o cmake...'
+    cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_MARCH_NATIVE=OFF \
+        -DG2O_USE_OPENGL=OFF -DG2O_BUILD_APPS=OFF -DG2O_BUILD_EXAMPLES=OFF \
+        || fail 'g2o cmake failed (see output above)'
+    echo '  Compiling g2o...'
+    make -j$(nproc) || fail 'g2o make failed (see output above)'
+    echo '  Installing g2o...'
+    make install > /tmp/g2o_install.log 2>&1 || sudo make install > /tmp/g2o_install.log 2>&1
+    if [ ! -f /usr/local/lib/cmake/g2o/g2oConfig.cmake ]; then
+        echo '  g2o install output (last 30 lines):'
+        tail -30 /tmp/g2o_install.log
+        fail 'g2o install did not produce g2oConfig.cmake'
+    fi
+    ldconfig 2>/dev/null || true
+    echo '  g2o installed successfully.'
+fi
+
+echo ''
+echo '=============================================================='
+echo '>>> [2/7] Cloning stella_vslam'
+echo '=============================================================='
+if [ ! -d "$STELLA" ]; then
+    git clone --recursive --depth 1 https://github.com/stella-cv/stella_vslam.git "$STELLA" \
+        || fail 'git clone of stella_vslam failed'
+fi
+cd "$STELLA" || fail "cd $STELLA failed"
+git submodule update --init --recursive || true
+
+echo ''
+echo '=============================================================='
+echo '>>> [3/7] Building bundled 3rd-party (FBoW)'
+echo '=============================================================='
+for sub in 3rd/FBoW 3rd/fbow; do
+    if [ -d "$STELLA/$sub" ]; then
+        echo "  --- $sub ---"
+        rm -rf "$STELLA/$sub/build"
+        mkdir -p "$STELLA/$sub/build"
+        cd "$STELLA/$sub/build" || fail "cd $sub/build failed"
+        echo "  Running cmake in $sub..."
+        cmake .. -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS='-Wno-error -Wno-deprecated-declarations' \
+            || fail "$sub cmake failed (see output above)"
+        echo "  Compiling $sub..."
+        make -j$(nproc) || fail "$sub make failed (see output above)"
+        echo "  Installing $sub..."
+        make install > /tmp/sub_install.log 2>&1 || sudo make install > /tmp/sub_install.log 2>&1
+        if [ $? -ne 0 ]; then
+            echo "  $sub install output (last 20 lines):"
+            tail -20 /tmp/sub_install.log
+            fail "$sub install failed"
+        fi
     fi
 done
 ldconfig 2>/dev/null || true
 
-echo '=== Building Stella-VSLAM (headless) ==='
+echo ''
+echo '=============================================================='
+echo '>>> [4/7] Configuring stella_vslam (cmake)'
+echo '=============================================================='
+echo '    (Note: BUILD_EXAMPLES / USE_PANGOLIN_VIEWER / USE_SOCKET_PUBLISHER'
+echo '     / USE_STACK_TRACE_LOGGER are NOT options on stella_vslam itself'
+echo '     anymore - examples were extracted into stella_vslam_examples.)'
+cd "$STELLA" || fail "cd $STELLA failed"
+rm -rf build
 mkdir -p build && cd build
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
-    -DUSE_PANGOLIN_VIEWER=OFF \
-    -DUSE_SOCKET_PUBLISHER=OFF \
-    -DUSE_STACK_TRACE_LOGGER=ON \
     -DBUILD_TESTS=OFF \
-    -DBUILD_EXAMPLES=ON \
-    2>&1 | tail -20
+    -DCMAKE_CXX_FLAGS='-Wno-error -Wno-deprecated-declarations' \
+    || fail 'stella cmake failed (see output above)'
 
-make -j$(nproc) 2>&1 | tail -15
-
-STELLA_BIN=$(find /content/stella_vslam/build -name 'run_euroc*' -type f 2>/dev/null | head -1)
-if [ -n "$STELLA_BIN" ]; then
-    echo '=== STELLA-VSLAM BUILD SUCCESSFUL ==='
-    echo "Binary: $STELLA_BIN"
-else
-    echo '=== Stella build produced no run_euroc binary ==='
-    echo 'Executables in build/:'
-    find /content/stella_vslam/build -type f -executable | head -20
-    exit 1
+echo ''
+echo '=============================================================='
+echo '>>> [5/7] Compiling + installing stella_vslam (longest step, ~5-15 min)'
+echo '=============================================================='
+make -j$(nproc) || fail 'stella make failed (see output above)'
+echo '  Installing stella_vslam (so the examples repo can find_package it)...'
+make install > /tmp/stella_install.log 2>&1 || sudo make install > /tmp/stella_install.log 2>&1
+if [ ! -f /usr/local/lib/cmake/stella_vslam/stella_vslamConfig.cmake ]; then
+    echo '  stella install output (last 30 lines):'
+    tail -30 /tmp/stella_install.log
+    fail 'stella install did not produce stella_vslamConfig.cmake'
 fi
+ldconfig 2>/dev/null || true
+
+echo ''
+echo '=============================================================='
+echo '>>> [6/7] Cloning + building stella_vslam_examples (provides run_euroc_slam)'
+echo '=============================================================='
+if [ ! -d "$EXAMPLES" ]; then
+    echo '  Cloning stella_vslam_examples...'
+    git clone --recursive --depth 1 https://github.com/stella-cv/stella_vslam_examples.git "$EXAMPLES" \
+        || fail 'git clone of stella_vslam_examples failed'
+fi
+cd "$EXAMPLES" || fail "cd $EXAMPLES failed"
+git submodule update --init --recursive || true
+rm -rf build
+mkdir -p build && cd build
+echo '  Running examples cmake (no viewers - headless)...'
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DUSE_STACK_TRACE_LOGGER=OFF \
+    -DCMAKE_CXX_FLAGS='-Wno-error -Wno-deprecated-declarations' \
+    || fail 'stella_vslam_examples cmake failed (see output above)'
+echo '  Compiling stella_vslam_examples...'
+make -j$(nproc) || fail 'stella_vslam_examples make failed (see output above)'
+
+echo ''
+echo '=============================================================='
+echo '>>> [7/7] Locating run_euroc_slam binary'
+echo '=============================================================='
+STELLA_BIN=$(find "$EXAMPLES/build" "$STELLA/build" -name 'run_euroc*' -type f -executable 2>/dev/null | head -1)
+if [ -z "$STELLA_BIN" ]; then
+    echo 'cmake+make succeeded but no run_euroc* binary.'
+    echo 'Executables under examples/build/:'
+    find "$EXAMPLES/build" -type f -executable 2>/dev/null | head -20
+    fail 'no run_euroc* binary (example target may have been renamed upstream)'
+fi
+echo "=== STELLA-VSLAM BUILD SUCCESSFUL ==="
+echo "Binary: $STELLA_BIN"
+echo 'ok' > "$STATE_FILE"
 """)
 
 # ---------------------------------------------------------------- Cell 7
@@ -908,13 +1038,18 @@ md("""---
 
 code(r"""import subprocess, os, time, shutil, json, glob
 
-STELLA  = '/content/stella_vslam'
-VOCAB   = f'{STELLA}/vocab/orb_vocab.fbow'
-RESULTS = '/content/results/stella'
-DRIVE   = '/content/drive/MyDrive/slam_results/stella'
+STELLA   = '/content/stella_vslam'
+EXAMPLES = '/content/stella_vslam_examples'
+VOCAB    = f'{STELLA}/vocab/orb_vocab.fbow'
+RESULTS  = '/content/results/stella'
+DRIVE    = '/content/drive/MyDrive/slam_results/stella'
 
-# Find the run_euroc binary (location varies between stella versions)
-STELLA_BIN = next(iter(sorted(glob.glob(f'{STELLA}/build/**/run_euroc*', recursive=True))), None)
+# Find the run_euroc binary. Upstream split examples (run_euroc_slam etc.)
+# into stella_vslam_examples; check there first, fall back to legacy path.
+STELLA_BIN = (
+    next(iter(sorted(glob.glob(f'{EXAMPLES}/build/**/run_euroc*', recursive=True))), None)
+    or next(iter(sorted(glob.glob(f'{STELLA}/build/**/run_euroc*', recursive=True))), None)
+)
 
 # Locate a monocular EuRoC config YAML shipped with Stella
 STELLA_CONFIG = None
