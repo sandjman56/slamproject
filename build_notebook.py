@@ -226,32 +226,21 @@ Shared deps for all three SLAM systems plus `xvfb` for headless rendering.
 code(r"""%%bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
-LOG=/tmp/apt_install.log
-: > "$LOG"
 
 echo '=== Installing apt dependencies ==='
-# Repair any broken/half-configured dpkg state from the Colab/Kaggle base image
-dpkg --configure -a >> "$LOG" 2>&1 || true
-apt-get install -f -y -qq >> "$LOG" 2>&1 || true
+echo '--- All output shown inline for debugging ---'
 
-echo '  updating package lists...'
-apt-get update -qq >> "$LOG" 2>&1 || { echo '--- apt-get update failed ---'; tail -40 "$LOG"; exit 1; }
+# Repair any broken/half-configured dpkg state
+dpkg --configure -a 2>&1 || true
+apt-get install -f -y -qq 2>&1 || true
 
-# Packages whose names sometimes change between Ubuntu releases are installed
-# individually with a fallback so a single missing package doesn't kill the cell.
-apt_install_one() {
-    for pkg in "$@"; do
-        if apt-get install -y -qq "$pkg" >> "$LOG" 2>&1; then
-            return 0
-        fi
-    done
-    echo "WARNING: none of [$*] could be installed; continuing." >&2
-    return 0
-}
+echo ''
+echo '>>> apt-get update'
+apt-get update -qq 2>&1
 
-# Core toolchain (must succeed)
-echo '  installing core packages (this takes 3-5 min on Kaggle)...'
-apt-get install -y -qq \
+echo ''
+echo '>>> Installing core packages (this is the slow step, ~3-5 min)...'
+apt-get install -y \
     cmake gcc g++ git wget unzip pkg-config ca-certificates \
     xvfb \
     libeigen3-dev \
@@ -266,17 +255,29 @@ apt-get install -y -qq \
     libspdlog-dev nlohmann-json3-dev \
     libzip-dev libpng-dev \
     python3-pip \
-    >> "$LOG" 2>&1 || { echo '--- apt-get install (core) failed, last 60 lines of log: ---'; tail -60 "$LOG"; exit 1; }
-echo '  core packages done.'
+    2>&1
+echo '>>> Core packages done.'
 
-# Packages that were renamed/split across Ubuntu versions — try each name in turn
-echo '  installing optional/renamed packages...'
+# Packages that were renamed/split across Ubuntu versions
+apt_install_one() {
+    for pkg in "$@"; do
+        if apt-get install -y -qq "$pkg" 2>&1; then
+            return 0
+        fi
+    done
+    echo "WARNING: none of [$*] could be installed; continuing."
+    return 0
+}
+
+echo ''
+echo '>>> Installing optional/renamed packages...'
 apt_install_one libgl-dev libgl1-mesa-dev
 apt_install_one libegl-dev libegl1-mesa-dev
 apt_install_one libc++-dev libc++-14-dev libc++-13-dev libc++-12-dev
 apt_install_one libjpeg-dev libjpeg-turbo8-dev libjpeg62-turbo-dev
 
-echo '=== Installing Python packages ==='
+echo ''
+echo '>>> Installing Python packages...'
 pip install -q 'evo==1.28.0' numpy matplotlib pandas tqdm
 
 echo '--- Versions ---'
