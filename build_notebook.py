@@ -225,14 +225,16 @@ Shared deps for all three SLAM systems plus `xvfb` for headless rendering.
 
 code(r"""%%bash
 set -e
+export DEBIAN_FRONTEND=noninteractive
 LOG=/tmp/apt_install.log
 : > "$LOG"
 
 echo '=== Installing apt dependencies ==='
-# Repair any broken/half-configured dpkg state from the Colab base image
+# Repair any broken/half-configured dpkg state from the Colab/Kaggle base image
 dpkg --configure -a >> "$LOG" 2>&1 || true
 apt-get install -f -y -qq >> "$LOG" 2>&1 || true
 
+echo '  updating package lists...'
 apt-get update -qq >> "$LOG" 2>&1 || { echo '--- apt-get update failed ---'; tail -40 "$LOG"; exit 1; }
 
 # Packages whose names sometimes change between Ubuntu releases are installed
@@ -248,6 +250,7 @@ apt_install_one() {
 }
 
 # Core toolchain (must succeed)
+echo '  installing core packages (this takes 3-5 min on Kaggle)...'
 apt-get install -y -qq \
     cmake gcc g++ git wget unzip pkg-config ca-certificates \
     xvfb \
@@ -264,8 +267,10 @@ apt-get install -y -qq \
     libzip-dev libpng-dev \
     python3-pip \
     >> "$LOG" 2>&1 || { echo '--- apt-get install (core) failed, last 60 lines of log: ---'; tail -60 "$LOG"; exit 1; }
+echo '  core packages done.'
 
 # Packages that were renamed/split across Ubuntu versions — try each name in turn
+echo '  installing optional/renamed packages...'
 apt_install_one libgl-dev libgl1-mesa-dev
 apt_install_one libegl-dev libegl1-mesa-dev
 apt_install_one libc++-dev libc++-14-dev libc++-13-dev libc++-12-dev
