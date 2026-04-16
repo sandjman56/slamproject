@@ -138,24 +138,51 @@ Shared deps for all three SLAM systems plus `xvfb` for headless rendering.
 
 code(r"""%%bash
 set -e
+LOG=/tmp/apt_install.log
+: > "$LOG"
+
 echo '=== Installing apt dependencies ==='
-apt-get update -qq
+# Repair any broken/half-configured dpkg state from the Colab base image
+dpkg --configure -a >> "$LOG" 2>&1 || true
+apt-get install -f -y -qq >> "$LOG" 2>&1 || true
+
+apt-get update -qq >> "$LOG" 2>&1 || { echo '--- apt-get update failed ---'; tail -40 "$LOG"; exit 1; }
+
+# Packages whose names sometimes change between Ubuntu releases are installed
+# individually with a fallback so a single missing package doesn't kill the cell.
+apt_install_one() {
+    for pkg in "$@"; do
+        if apt-get install -y -qq "$pkg" >> "$LOG" 2>&1; then
+            return 0
+        fi
+    done
+    echo "WARNING: none of [$*] could be installed; continuing." >&2
+    return 0
+}
+
+# Core toolchain (must succeed)
 apt-get install -y -qq \
     cmake gcc g++ git wget unzip pkg-config ca-certificates \
     xvfb \
     libeigen3-dev \
     libopencv-dev libopencv-contrib-dev \
-    libglew-dev libgl1-mesa-dev libegl1-mesa-dev libwayland-dev libxkbcommon-dev \
-    libepoxy-dev libc++-dev \
+    libglew-dev libwayland-dev libxkbcommon-dev \
+    libepoxy-dev \
     libboost-all-dev \
     libsuitesparse-dev \
     libyaml-cpp-dev \
     libssl-dev \
     libgoogle-glog-dev libgflags-dev \
     libspdlog-dev nlohmann-json3-dev \
-    libzip-dev libpng-dev libjpeg-dev \
+    libzip-dev libpng-dev \
     python3-pip \
-    > /dev/null 2>&1
+    >> "$LOG" 2>&1 || { echo '--- apt-get install (core) failed, last 60 lines of log: ---'; tail -60 "$LOG"; exit 1; }
+
+# Packages that were renamed/split across Ubuntu versions — try each name in turn
+apt_install_one libgl-dev libgl1-mesa-dev
+apt_install_one libegl-dev libegl1-mesa-dev
+apt_install_one libc++-dev libc++-14-dev libc++-13-dev libc++-12-dev
+apt_install_one libjpeg-dev libjpeg-turbo8-dev libjpeg62-turbo-dev
 
 echo '=== Installing Python packages ==='
 pip install -q 'evo==1.28.0' numpy matplotlib pandas tqdm
@@ -163,7 +190,7 @@ pip install -q 'evo==1.28.0' numpy matplotlib pandas tqdm
 echo '--- Versions ---'
 echo "CMake  : $(cmake --version | head -1)"
 echo "GCC    : $(gcc --version | head -1)"
-python3 -c "import cv2; print(f'OpenCV : {cv2.__version__}')"
+python3 -c "import cv2; print(f'OpenCV : {cv2.__version__}')" || echo 'OpenCV : (python binding not installed — C++ libs only)'
 echo "Eigen  : $(pkg-config --modversion eigen3 2>/dev/null || echo '(headers at /usr/include/eigen3)')"
 echo "xvfb   : $(which xvfb-run)"
 echo '=== Done ==='
