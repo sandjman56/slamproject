@@ -37,15 +37,25 @@ md("""# Visual SLAM Benchmarking Under Degraded Conditions
 **16-833 Project — Sander Schulman**
 
 Benchmarks **ORB-SLAM3**, **Stella-VSLAM**, and **DSO** (best-effort) on six
-EuRoC MAV sequences spanning three difficulty levels. Runs entirely in Google
-Colab: builds each SLAM system from source, downloads the dataset, runs each
-system N times per sequence, and evaluates with the `evo` toolkit.
+EuRoC MAV sequences spanning three difficulty levels. Runs on **Google Colab
+or Kaggle Notebooks** — the platform is auto-detected in cell 1.
 
-### How to use
+### How to use (Colab)
 1. **Runtime → Change runtime type → any CPU/GPU instance** (GPU not required, just gives more RAM).
 2. Run cells **in order**. Cold start build time: ~30–40 min.
 3. Cells are idempotent — after a session timeout, re-run from the top.
 4. Trajectory outputs are checkpointed to Google Drive after every sequence.
+
+### How to use (Kaggle)
+1. **Settings panel → Accelerator: None** (or GPU for more RAM), **Internet: On**.
+2. Optional but recommended: attach the EuRoC MAV dataset as an input if you find
+   a public copy on Kaggle (search "EuRoC MAV"). Cell 9 will auto-use
+   `/kaggle/input/*euroc*/` if present; otherwise it falls back to wget.
+3. Run all. Use **"Save Version" → "Save & Run All (Commit)"** to execute in the
+   background — Kaggle will email you when it finishes and `/kaggle/working/`
+   outputs persist across sessions.
+4. Build tree lives in `/kaggle/temp` (wiped between sessions). Results live in
+   `/kaggle/working/slam_results` (persists across session restarts).
 
 ### Pipeline
 ```
@@ -72,13 +82,53 @@ system N times per sequence, and evaluates with the `evo` toolkit.
 
 # ---------------------------------------------------------------- Cell 1
 md("""---
-## 0. Mount Drive & create directories
+## 0. Detect platform, mount persistent storage, create directories
+
+Auto-detects **Colab** vs **Kaggle**. On Kaggle we symlink `/content` → a
+scratch dir under `/kaggle/temp` and `/content/drive/MyDrive/slam_results` →
+`/kaggle/working/slam_results`, so every downstream cell's hardcoded
+`/content/...` paths work identically on both platforms.
 """)
 
-code("""from google.colab import drive
-import os, shutil
+code("""import os, shutil, sys
 
-drive.mount('/content/drive')
+# ---- Platform detection ----
+if 'KAGGLE_KERNEL_RUN_TYPE' in os.environ or os.path.isdir('/kaggle/working'):
+    PLATFORM = 'kaggle'
+elif 'COLAB_GPU' in os.environ or os.path.isdir('/content'):
+    PLATFORM = 'colab'
+else:
+    PLATFORM = 'local'
+print(f'Platform: {PLATFORM}')
+
+if PLATFORM == 'colab':
+    from google.colab import drive
+    drive.mount('/content/drive')
+    CHECKPOINT_ROOT = '/content/drive/MyDrive/slam_results'
+
+elif PLATFORM == 'kaggle':
+    # Kaggle rootfs is an overlayfs that refuses os.symlink at '/', so we
+    # mkdir /content directly. Kaggle's session has ~73 GB of shared scratch
+    # across '/', /kaggle/temp, and /kaggle/working — plenty for the build
+    # tree + EuRoC. Checkpoints go to /kaggle/working/slam_results which
+    # persists across notebook commits (the only "saved" storage on Kaggle).
+    os.makedirs('/content', exist_ok=True)
+    CHECKPOINT_ROOT = '/kaggle/working/slam_results'
+    os.makedirs(CHECKPOINT_ROOT, exist_ok=True)
+    os.makedirs('/content/drive/MyDrive', exist_ok=True)
+    link = '/content/drive/MyDrive/slam_results'
+    if not os.path.exists(link) and not os.path.islink(link):
+        try:
+            os.symlink(CHECKPOINT_ROOT, link)
+        except (OSError, NotImplementedError) as e:
+            # Fallback if the filesystem refuses symlinks: use a plain dir.
+            # A final cell at notebook end copies this to CHECKPOINT_ROOT.
+            print(f'Warning: symlink to {CHECKPOINT_ROOT} failed ({e}); using directory fallback.')
+            os.makedirs(link, exist_ok=True)
+
+else:
+    raise RuntimeError(
+        'Unsupported platform. Run this notebook on Google Colab or Kaggle.')
 
 DIRS = [
     '/content/euroc',
@@ -94,8 +144,45 @@ DIRS = [
 for d in DIRS:
     os.makedirs(d, exist_ok=True)
 
-print('Directory structure ready.')
-print(f'Disk space: {shutil.disk_usage("/content").free / 1e9:.1f} GB free')
+print(f'Checkpoints: {CHECKPOINT_ROOT}')
+print(f'Disk free  : {shutil.disk_usage("/content").free / 1e9:.1f} GB at /content')
+""")
+
+# ---------------------------------------------------------------- Cell 1b
+md("""---
+## 0b. Restore build cache (if available)
+
+On Kaggle: `/kaggle/working/build_cache.tgz` persists across notebook commits.
+On Colab: uses `drive/MyDrive/slam_build_cache.tgz`.
+
+If the cache exists, we untar it into `/` and `/usr/local` — that restores the
+entire Pangolin / ORB-SLAM3 / Stella / DSO build tree in ~30 seconds, turning
+the ~30–40 min cold rebuild into a skip. If it doesn't exist, this cell is a
+no-op and cells 2–8 will build from source normally. After the first
+successful build, run the "snapshot build cache" cell below to populate it.
+""")
+
+code("""import os, subprocess
+
+if PLATFORM == 'kaggle':
+    BUILD_CACHE = '/kaggle/working/build_cache.tgz'
+elif PLATFORM == 'colab':
+    BUILD_CACHE = '/content/drive/MyDrive/slam_build_cache.tgz'
+else:
+    BUILD_CACHE = None
+
+if BUILD_CACHE and os.path.isfile(BUILD_CACHE) and not os.path.isdir('/content/ORB_SLAM3'):
+    sz = os.path.getsize(BUILD_CACHE) / 1e9
+    print(f'Restoring build cache from {BUILD_CACHE} ({sz:.2f} GB) ...')
+    subprocess.run(['tar', 'xzf', BUILD_CACHE, '-C', '/'], check=True)
+    subprocess.run(['ldconfig'], check=False)
+    print('Cache restored. Cells 4-8 will skip their build steps.')
+elif os.path.isdir('/content/ORB_SLAM3'):
+    print('Build tree already present in /content — nothing to restore.')
+else:
+    print(f'No build cache found at {BUILD_CACHE}.')
+    print('Cells 2-8 will build from source (~30-40 min).')
+    print('After that finishes, run the "snapshot build cache" cell to save it.')
 """)
 
 # ---------------------------------------------------------------- Cell 2
@@ -217,15 +304,29 @@ if [ ! -d Pangolin ]; then
     git clone --depth 1 --branch v0.6 https://github.com/stevenlovegrove/Pangolin.git
 fi
 cd Pangolin
+rm -rf build   # start clean — a half-finished prior build will re-trigger the same errors
 mkdir -p build && cd build
+
+# BUILD_TOOLS=OFF skips Pangolin's VideoViewer / VideoConvert binaries. On
+# current Colab (Ubuntu 22.04), linking those fails with
+#   libGL.so: undefined reference to '_glapi_tls_Current'
+# because mesa's libGL doesn't carry an implicit libglapi link. ORB-SLAM3 only
+# needs the Pangolin *library*, which builds and installs cleanly without the
+# tools. BUILD_PANGOLIN_FFMPEG=OFF avoids another common v0.6 break on recent
+# ffmpeg. -Wno-error keeps picojson.h -Wparentheses warnings from failing the
+# build if -Werror is on.
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_EXAMPLES=OFF \
     -DBUILD_TESTS=OFF \
+    -DBUILD_TOOLS=OFF \
     -DBUILD_PANGOLIN_PYTHON=OFF \
-    > /tmp/pangolin_cmake.log 2>&1 || { tail -30 /tmp/pangolin_cmake.log; exit 1; }
-make -j$(nproc) > /tmp/pangolin_build.log 2>&1 || { tail -40 /tmp/pangolin_build.log; exit 1; }
-make install > /dev/null 2>&1
+    -DBUILD_PANGOLIN_FFMPEG=OFF \
+    -DCMAKE_CXX_FLAGS='-Wno-error -Wno-parentheses -Wno-deprecated-declarations' \
+    > /tmp/pangolin_cmake.log 2>&1 || { echo '--- cmake log (last 40 lines): ---'; tail -40 /tmp/pangolin_cmake.log; exit 1; }
+
+make -j$(nproc) > /tmp/pangolin_build.log 2>&1 || { echo '--- make log (last 60 lines): ---'; tail -60 /tmp/pangolin_build.log; exit 1; }
+make install > /tmp/pangolin_install.log 2>&1 || { echo '--- install log: ---'; tail -40 /tmp/pangolin_install.log; exit 1; }
 ldconfig
 echo '=== Pangolin installed ==='
 """)
@@ -443,6 +544,55 @@ else
 fi
 """)
 
+# ---------------------------------------------------------------- Cell 8b
+md("""---
+## 6b. Snapshot build cache (run once, then leave disabled)
+
+After cells 2–8 have all succeeded at least once, flip `SAVE_BUILD_CACHE = True`
+in the cell below and run it. It tars up Pangolin / ORB-SLAM3 / Stella / DSO
+plus the `/usr/local` Pangolin install, and saves to either
+`/kaggle/working/build_cache.tgz` (Kaggle) or Drive (Colab).
+
+On subsequent sessions the "restore build cache" cell at the top will
+untar this in ~30 sec, skipping the 30–40 min rebuild.
+
+**Leave `SAVE_BUILD_CACHE = False` for normal runs** — re-tarring adds
+2–3 minutes and isn't needed unless you've changed the build.
+""")
+
+code(r"""%%bash
+SAVE_BUILD_CACHE=0   # set to 1 ONCE after a clean build, then back to 0
+
+if [ "$SAVE_BUILD_CACHE" != "1" ]; then
+    echo 'SAVE_BUILD_CACHE=0 — skipping snapshot.'
+    exit 0
+fi
+
+# Pick destination based on whether we're on Kaggle or Colab
+if [ -d /kaggle/working ]; then
+    CACHE=/kaggle/working/build_cache.tgz
+elif [ -d /content/drive/MyDrive ]; then
+    CACHE=/content/drive/MyDrive/slam_build_cache.tgz
+else
+    echo 'No persistent destination found.' >&2
+    exit 1
+fi
+
+mkdir -p "$(dirname "$CACHE")"
+echo "Snapshotting build tree to $CACHE ..."
+
+# -C / + relative paths avoids tar's "removing leading /" warnings.
+# Excludes strip the bulky object files we don't need for runtime.
+tar czf "$CACHE" \
+    --exclude='*.o' --exclude='*.obj' --exclude='.git' --exclude='Thirdparty/*/build/CMakeFiles' \
+    -C / \
+    $(cd / && ls -d content/Pangolin content/ORB_SLAM3 content/stella_vslam content/dso content/dso_status 2>/dev/null) \
+    $(cd / && ls -d usr/local/lib/libpango_*.so* usr/local/include/pangolin 2>/dev/null)
+
+SZ=$(du -h "$CACHE" | awk '{print $1}')
+echo "=== Snapshot saved: $CACHE ($SZ) ==="
+""")
+
 # ---------------------------------------------------------------- Cell 9
 md("""---
 ## 7. Download EuRoC sequences
@@ -455,15 +605,41 @@ Downloads the six-sequence subset defined in Section V.B of the midterm:
 Skips sequences already on disk.
 """)
 
-code(r"""import os, subprocess, shutil
+code(r"""import os, subprocess, shutil, glob
 
 EUROC_BASE = 'http://robotics.ethz.ch/~asl-datasets/ijrr_euroc_mav_dataset'
 DEST       = '/content/euroc'
+
+# ---- Kaggle: check if a EuRoC dataset is already attached as an input ----
+# If a user attached a public EuRoC MAV dataset to the notebook, symlink its
+# sequence folders into /content/euroc instead of re-downloading (~10 min saved).
+def _try_kaggle_input():
+    found = {}
+    candidates = glob.glob('/kaggle/input/*/**/mav0', recursive=True)
+    for mav0 in candidates:
+        # Sequence name is the parent dir of mav0/
+        seq_dir = os.path.dirname(mav0)
+        seq_name = os.path.basename(seq_dir)
+        found[seq_name] = seq_dir
+    return found
+
+kaggle_map = _try_kaggle_input() if os.path.isdir('/kaggle/input') else {}
+if kaggle_map:
+    print(f'[KAGGLE] Found {len(kaggle_map)} EuRoC sequences in /kaggle/input — using those.')
 
 for seq_name, subfolder, _ in SEQUENCES:
     target = f'{DEST}/{seq_name}'
     if os.path.isdir(f'{target}/mav0'):
         print(f'[SKIP] {seq_name} already downloaded')
+        continue
+
+    # Kaggle fast path: symlink the attached dataset's sequence folder
+    if seq_name in kaggle_map:
+        os.makedirs(target, exist_ok=True)
+        link = f'{target}/mav0'
+        if not os.path.exists(link):
+            os.symlink(f'{kaggle_map[seq_name]}/mav0', link)
+        print(f'[LINK] {seq_name} -> {kaggle_map[seq_name]}')
         continue
 
     url = f'{EUROC_BASE}/{subfolder}/{seq_name}/{seq_name}.zip'
